@@ -59,7 +59,7 @@ Options:
 
 ```sh
 sudo ./install-cachyos.sh --version 26.2.5   # if detection is ambiguous
-sudo ./install-cachyos.sh --so /path/libvulkan_intel.so
+sudo ./install-cachyos.sh --so /path/libvulkan_intel.so   # deploy a prebuilt
 sudo ./install-cachyos.sh --restore          # roll back
 ```
 
