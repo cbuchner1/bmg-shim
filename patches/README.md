@@ -4,8 +4,7 @@
 
 Two snapshots of the same shim feature set, one per Mesa base.  The
 `anv_va_encode.c` files differ in their Mesa context/version, so their md5s
-are not identical.  The current snapshots are dated **2026-11-08**; the older
-`2026-11-07` patches in this directory are superseded and should not be used.
+are not identical.  The snapshots are dated **2026-11-08**.
 
 Both snapshots contain the environment migration: the encoder options are
 `ANV_VA_*` environment variables, not `/tmp/va_*` flag files; the logs default
@@ -50,16 +49,6 @@ meson setup build -Dbuildtype=release -Dwerror=false -Degl=disabled \
   -Dplatforms=x11,wayland -Dvideo-codecs=all -Dvulkan-drivers=intel
 ninja -C build src/intel/vulkan/libvulkan_intel.so
 ```
-
-## What changed in the 2026-11-08 snapshot
-
-- `rc_fps` acceptance widened: any plausible application rate-control fps
-  (1–240) is now honoured, instead of requiring it to be within ±10% of the
-  90 fallback.  This makes a configured 72 fps stream actually use 72.
-- Encode caps: `maxCodedExtent` 16384×12288 and H.265 encode `maxLevelIdc`
-  6.2.
-- `maxBitrate` 350,000,000.
-- Earlier level/`CpbBrNalFactor` and clamp-to-6.2 fixes are included.
 
 The distro package is `vulkan-intel 3:26.2.6-1`; installing the 26.2.6 build
 would make the ICD file version match the package again (still patched, so
