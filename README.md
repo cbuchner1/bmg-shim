@@ -15,6 +15,54 @@ PCVR to a Steam Frame headset on an Arc B570/B580 GPU.
   encode support is gated to older platforms / `ANV_DEBUG(VIDEO_ENCODE)`, even
   though the hardware has **two VCS media engines** and iHD supports HEVC.
 
+## Limitations
+
+- The Vulkan support is not intended to be generic. It is only tested on the
+  P010 video surface used by the SteamVR texture atlas containing both the
+  foveated and the peripheral views for left and right eye.
+
+## Best practices: Start with low render settings
+
+Initially start with low specs, such that steaming quality issues are not
+caused by overloading the render/encoding pipeline from the start.
+
+-General: Set render resolution to Custom 2476x2476 per eye (100%)
+-Steam Link: Set Target Bandwidth to Auto
+-Steam Link: Set Encoded Video Size to Manual, Size (px) to 768
+
+## Enabling VR streaming
+
+In the headset, actiate the Steam Overlay bar and click on the Streaming Status
+Icon and under Available Computers flop open "Advanced" and select "Stream VR
+without game". This should show you a streamed Steam environment and the Steam
+interface streamed from your PC. If the Steam interface does not show on its
+own, open it using the "Steam" icon (with the green remote symbol) in the steam
+overlay bar.
+
+Try running a game with modest graphics requirement first, such as Beat Saber.
+
 ## How to build and install
 
-A simple install method is being worked on at the moment.
+On CachyOS, the installer builds the patched ANV driver from the matching
+patch in `patches/` and installs it over the distro's `libvulkan_intel.so`:
+
+```sh
+sudo ./install-cachyos.sh
+```
+
+It detects the installed `vulkan-intel`/`mesa` version, selects
+`patches/anv-va-h265-shim-mesa-<version>-2026-11-08.patch`, installs the
+build dependencies, clones the matching Mesa tag, applies the patch, builds
+`libvulkan_intel.so`, backs up the existing one and installs the new one.
+
+Options:
+
+```sh
+sudo ./install-cachyos.sh --version 26.2.5   # if detection is ambiguous
+sudo ./install-cachyos.sh --so /path/libvulkan_intel.so
+sudo ./install-cachyos.sh --restore          # roll back
+```
+
+The CachyOS container (`docker/Dockerfile`) is only a verification/CI aid and
+is not required for installation.  See `docker/INSTALL-cachyos.md` for the
+full native and container instructions.
