@@ -43,6 +43,25 @@ Try running a game with modest graphics requirement first, such as Beat Saber.
 
 ## How to build and install
 
+### Pre-installation requirements
+
+Install the Intel graphics/Vulkan runtime and the verification tools before
+running the installer:
+
+```sh
+sudo pacman -S --needed \
+  mesa vulkan-intel vulkan-icd-loader intel-media-driver \
+  libva libdrm linux-firmware \
+  vulkan-tools libva-utils intel-gpu-tools
+```
+
+- `mesa` / `vulkan-intel` / `vulkan-icd-loader` — Intel ANV driver, the
+  `libvulkan_intel.so` ICD and the Vulkan loader.
+- `intel-media-driver` / `libva` — iHD VA-API backend used by the shim.
+- `libdrm` / `linux-firmware` — DRM and GPU firmware.
+- `vulkan-tools` (`vulkaninfo`), `libva-utils` (`vainfo`) and
+  `intel-gpu-tools` (`intel_gpu_top`) — verification/diagnostics.
+
 On CachyOS, the installer builds the patched ANV driver from the matching
 patch in `patches/` and installs it over the distro's `libvulkan_intel.so`:
 
