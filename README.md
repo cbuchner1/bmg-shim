@@ -7,8 +7,9 @@ PCVR to a Steam Frame headset on an Arc B570/B580 GPU.
 
 ## Why this exists
 
-- A PC with an Intel Arc B570/B580 (BMG) runs SteamVR and the Steam Frame's
-  wireless PCVR client.
+A PC with an Intel Arc B570/B580 (BMG) runs SteamVR but will not detect
+the Steam Frame or controllers for the following reasons:
+
 - SteamVR's vrlink path uses **Vulkan Video H.265 encode**
   (`VK_KHR_video_encode_h265`).
 - Mesa's ANV on BMG does not expose or implement that path: the generic video
@@ -62,6 +63,7 @@ sudo pacman -S --needed \
 - `vulkan-tools` (`vulkaninfo`), `libva-utils` (`vainfo`) and
   `intel-gpu-tools` (`intel_gpu_top`) — verification/diagnostics.
 
+### Running the installation script
 On CachyOS, the installer builds the patched ANV driver from the matching
 patch in `patches/` and installs it over the distro's `libvulkan_intel.so`:
 
