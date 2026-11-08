@@ -16,10 +16,10 @@ dumps.
 
 - Base: `ddaf85e` “VERSION: bump for 26.2.5” (tag `mesa-26.2.5`)
 - Patch: `anv-va-h265-shim-mesa-26.2.5-2026-11-08.patch`
-  - 191,892 bytes, md5 `224cd43c60af883f63c8fe52e671d43e`
+  - 192,362 bytes, md5 `262b032b8c1bb733e20b1feeb0d2cbc2`
   - 19 files (17 modified + 2 new)
-- `anv_va_encode.c` md5: `b282dda0106a370fead5d1fa09c1ea00`
-- Build/installed `.so`: `a9da6368291d2dbc4ba15d84bfca4ce0`
+- `anv_va_encode.c` md5: `782e4d59b1ab31ac4b0e51a59863e742`
+- Build/installed `.so`: `6a1ba17f5a3ac30d5bf1b0acaa9ee6f4`
 
 ```sh
 cd ~/mesa-26.2.5
@@ -34,11 +34,11 @@ sudo install -m 0644 build/src/intel/vulkan/libvulkan_intel.so \
 - Base: `8e87a50` “VERSION: bump for 26.2.6” (tag `mesa-26.2.6`, tag object
   `66b6349`)
 - Patch: `anv-va-h265-shim-mesa-26.2.6-2026-11-08.patch`
-  - 189,268 bytes, md5 `43459eb29ede4b782c8036ffea31bc85`
+  - 189,738 bytes, md5 `74a8b9fe76b33c65a03c93b7fee4e1c7`
   - 19 files (17 modified + 2 new)
-- `anv_va_encode.c` md5: `20295ec89b2b3bd37848820989e892f7`
+- `anv_va_encode.c` md5: `f25ceb097f2dbcac05198548351456c7`
 - Build: `~/mesa-26.2.6/build/src/intel/vulkan/libvulkan_intel.so`
-  md5 `76721a3c837e798155f557315f75e418` (not installed; the live driver is
+  md5 `7923a25893faa126383add91217a0cb4` (not installed; the live driver is
   the 26.2.5 build).
 
 ```sh
@@ -49,6 +49,9 @@ meson setup build -Dbuildtype=release -Dwerror=false -Degl=disabled \
   -Dplatforms=x11,wayland -Dvideo-codecs=all -Dvulkan-drivers=intel
 ninja -C build src/intel/vulkan/libvulkan_intel.so
 ```
+
+Both snapshots also set the single encode worker to `SCHED_FIFO` priority 50
+(best effort; falls back to CFS if the process lacks `CAP_SYS_NICE`).
 
 The distro package is `vulkan-intel 3:26.2.6-1`; installing the 26.2.6 build
 would make the ICD file version match the package again (still patched, so

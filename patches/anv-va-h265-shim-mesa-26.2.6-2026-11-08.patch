@@ -391,10 +391,10 @@ index d19f824..8b96968 100644
                                0, 0, &queue->companion_sync);
 diff --git a/src/intel/vulkan/anv_va_encode.c b/src/intel/vulkan/anv_va_encode.c
 new file mode 100644
-index 0000000..33023ca
+index 0000000..17b71b7
 --- /dev/null
 +++ b/src/intel/vulkan/anv_va_encode.c
-@@ -0,0 +1,3517 @@
+@@ -0,0 +1,3528 @@
 +#include "anv_va_encode.h"
 +#include <stdio.h>
 +#include <fcntl.h>
@@ -405,6 +405,7 @@ index 0000000..33023ca
 +                                      struct anv_va_job *job);
 +static bool va_slice_layout_enabled(void);
 +#include <errno.h>
++#include <sched.h>
 +#include <string.h>
 +#include <va/va.h>
 +#include <va/va_drm.h>
@@ -933,6 +934,16 @@ index 0000000..33023ca
 +{
 +   struct va_pool *pool = &va_pool;
 +   (void) arg;
++
++   /* Best-effort real-time scheduling: the worker only blocks on the queue
++    * and on iHD, so a modest FIFO priority reduces wakeup/preemption jitter.
++    * Requires CAP_SYS_NICE/root; fall back silently if denied. */
++   {
++      struct sched_param sp = { .sched_priority = 50 };
++      int r = pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
++      VLOG("worker: SCHED_FIFO prio 50 %s", r == 0 ? "enabled" : "unavailable");
++   }
++
 +   for (;;) {
 +      pthread_mutex_lock(&pool->lock);
 +      while (pool->count == 0)
