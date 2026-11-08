@@ -82,6 +82,7 @@ Options:
 sudo ./install-cachyos.sh --version 26.2.5   # if detection is ambiguous
 sudo ./install-cachyos.sh --so /path/libvulkan_intel.so   # deploy a prebuilt
 sudo ./install-cachyos.sh --restore          # roll back
+sudo ./install-cachyos.sh --build           # build from patches (default)
 sudo ./install-cachyos.sh --no-deps          # skip pacman build-dependency install
 ```
 
