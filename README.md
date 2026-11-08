@@ -26,9 +26,9 @@ PCVR to a Steam Frame headset on an Arc B570/B580 GPU.
 Initially start with low specs, such that steaming quality issues are not
 caused by overloading the render/encoding pipeline from the start.
 
--General: Set render resolution to Custom 2476x2476 per eye (100%)
--Steam Link: Set Target Bandwidth to Auto
--Steam Link: Set Encoded Video Size to Manual, Size (px) to 768
+- General: Set render resolution to Custom 2476x2476 per eye (100%)
+- Steam Link: Set Target Bandwidth to Auto
+- Steam Link: Set Encoded Video Size to Manual, Size (px) to 768
 
 ## Enabling VR streaming
 
