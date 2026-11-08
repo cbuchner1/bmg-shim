@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Run standalone installer (build + install) on CachyOS
-        run: install-cachyos.sh --build --version ${{ matrix.mesa }}
+        run: ./install-cachyos.sh --build --version ${{ matrix.mesa }}
       - uses: actions/upload-artifact@v4
         with:
           name: libvulkan_intel-${{ matrix.mesa }}
