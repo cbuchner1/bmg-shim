@@ -63,6 +63,6 @@ sudo ./install-cachyos.sh --so /path/libvulkan_intel.so
 sudo ./install-cachyos.sh --restore          # roll back
 ```
 
-The CachyOS container (`docker/Dockerfile`) is only a verification/CI aid and
-is not required for installation.  See `docker/INSTALL-cachyos.md` for the
-full native and container instructions.
+The installer is self-contained; a CachyOS container is only an optional
+local verification aid and is not required for installation.  See
+`INSTALL-cachyos.md` for the full native and container instructions.
