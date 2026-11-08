@@ -30,6 +30,7 @@ MODE="build"
 
 while [ $# -gt 0 ]; do
   case "$1" in
+    --build)   MODE="build"; shift ;;
     --version) VERSION="$2"; shift 2 ;;
     --patch)   PATCH="$2"; shift 2 ;;
     --so)      SO="$2"; MODE="install"; shift 2 ;;
