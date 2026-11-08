@@ -66,3 +66,19 @@ sudo ./install-cachyos.sh --restore          # roll back
 The installer is self-contained; a CachyOS container is only an optional
 local verification aid and is not required for installation.  See
 `INSTALL-cachyos.md` for the full native and container instructions.
+
+### Verify the install
+
+Confirm that the H.265 video encode path is exposed:
+
+```sh
+vulkaninfo 2>/dev/null | grep -iE "VK_KHR_video_encode"
+```
+
+Expected output:
+
+```
+VK_KHR_video_encode_h264                      : extension revision 14
+VK_KHR_video_encode_h265                      : extension revision 14
+VK_KHR_video_encode_queue                     : extension revision 12
+```
