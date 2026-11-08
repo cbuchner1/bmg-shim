@@ -1,0 +1,4451 @@
+diff --git a/src/intel/vulkan/anv_allocator.c b/src/intel/vulkan/anv_allocator.c
+index 51e36e4..2d8e949 100644
+--- a/src/intel/vulkan/anv_allocator.c
++++ b/src/intel/vulkan/anv_allocator.c
+@@ -1644,6 +1644,10 @@ anv_device_alloc_bo(struct anv_device *device,
+                     uint64_t explicit_address,
+                     struct anv_bo **bo_out)
+ {
++   /* TEST: make every BO exportable so the VA backend can PRIME-export
++    * video images. */
++   alloc_flags |= ANV_BO_ALLOC_EXTERNAL;
++
+    /* ANV_BO_ALLOC_MAPPED are internal allocated bos that need mmap() but as
+     * internally we don't do any cflush() we need to make sure those are also
+     * ANV_BO_ALLOC_HOST_COHERENT.
+diff --git a/src/intel/vulkan/anv_batch_chain.c b/src/intel/vulkan/anv_batch_chain.c
+index ed69d6d..d4cd7ad 100644
+--- a/src/intel/vulkan/anv_batch_chain.c
++++ b/src/intel/vulkan/anv_batch_chain.c
+@@ -30,6 +30,8 @@
+ #include <xf86drm.h>
+ 
+ #include "anv_private.h"
++#include "anv_va_encode.h"
++#include "util/os_time.h"
+ #include "anv_measure.h"
+ 
+ #include "common/intel_debug_identifier.h"
+@@ -1641,6 +1643,67 @@ anv_queue_submit(struct vk_queue *vk_queue,
+ 
+    uint64_t start_ts = intel_ds_begin_submit(&queue->ds);
+ 
++   /* VA-API encode backend: the application must not be told the submission is
++    * done before we have encoded the source image, otherwise it starts
++    * overwriting the image (view by view) while we read it, which shows up as
++    * views jumping relative to each other.  The KMD therefore signals a
++    * private sync and we signal the application's syncs after the encode. */
++   uint32_t va_job_count = 0;
++   for (uint32_t i = 0; i < submit->command_buffer_count; i++)
++      va_job_count += ((struct anv_cmd_buffer *)submit->command_buffers[i])->n_va_jobs;
++
++   /* Staged jobs encode from a linear buffer that the submission itself filled
++    * (the copy is recorded in the video command buffer), so the application may
++    * keep running: it cannot invalidate that buffer, and its own signals can be
++    * delivered by the KMD as usual.  All we need is one extra signal telling
++    * the encode worker when the GPU (and therefore the copy) is done.
++    *
++    * Jobs that encode straight from the application's image still have to hold
++    * the application's fence back until the encode finished. */
++   uint32_t va_staged_count = 0;
++   for (uint32_t i = 0; i < submit->command_buffer_count; i++) {
++      struct anv_cmd_buffer *cb = (struct anv_cmd_buffer *)submit->command_buffers[i];
++      for (uint32_t j = 0; j < cb->n_va_jobs; j++)
++         va_staged_count += cb->va_jobs[j].linear_buf != VK_NULL_HANDLE;
++   }
++   bool va_all_staged = va_job_count > 0 && va_staged_count == va_job_count;
++
++   struct vk_sync *va_sync = NULL;
++   struct vk_sync_signal va_signal = { 0 };
++   struct vk_sync_signal app_signals[8];
++   struct vk_sync_signal staged_signals[ARRAY_SIZE(app_signals) + 1];
++   uint32_t app_signal_count = 0;
++   bool va_deferred = false;
++   if (va_job_count > 0 &&
++       vk_sync_create(&device->vk, &device->physical->sync_syncobj_type,
++                      0, 0, &va_sync) == VK_SUCCESS) {
++      va_signal = (struct vk_sync_signal) { .sync = va_sync, .signal_value = 1 };
++      if (va_all_staged) {
++         if (submit->signal_count <= ARRAY_SIZE(app_signals)) {
++            memcpy(staged_signals, submit->signals,
++                   submit->signal_count * sizeof(staged_signals[0]));
++            staged_signals[submit->signal_count] = va_signal;
++            submit->signals = staged_signals;
++            submit->signal_count++;
++         } else {
++            /* Fall back to the deferred fence below. */
++            va_all_staged = false;
++         }
++      }
++      if (!va_all_staged && submit->signal_count > 0 &&
++          submit->signal_count <= ARRAY_SIZE(app_signals)) {
++         app_signal_count = submit->signal_count;
++         memcpy(app_signals, submit->signals,
++                app_signal_count * sizeof(app_signals[0]));
++         submit->signals = &va_signal;
++         submit->signal_count = 1;
++         va_deferred = true;
++         anv_va_log_msg("deferred fence: KMD signals a private sync");
++      }
++   } else {
++      va_sync = NULL;
++   }
++
+    if (submit->buffer_bind_count ||
+        submit->image_opaque_bind_count ||
+        submit->image_bind_count) {
+@@ -1655,6 +1718,53 @@ anv_queue_submit(struct vk_queue *vk_queue,
+    intel_ds_end_submit(&queue->ds, start_ts);
+    intel_ds_device_process(&device->ds, false);
+ 
++   /* VA-API encode backend: run the captured encode jobs once the GPU is done
++    * with the submission, and only then signal the application. */
++   if (result == VK_SUCCESS && va_job_count > 0) {
++      int64_t t0 = os_time_get_nano();
++      if (va_deferred && va_sync) {
++         submit->signals = app_signals;
++         submit->signal_count = app_signal_count;
++         VkResult va_wait_res = vk_sync_wait(&device->vk, va_sync, 1, 0,
++                                             UINT64_MAX);
++         if (va_wait_res != VK_SUCCESS)
++            return vk_queue_set_lost(&queue->vk, "VA encode sync wait failed");
++      } else if (!va_deferred && va_sync) {
++         /* Nothing to wait for here: the worker waits for the GPU.  Hand the
++          * application's syncs to it only in the deferred case above. */
++      } else {
++         for (uint32_t i = 0; i < submit->signal_count; i++)
++            if (submit->signals[i].sync->type->wait)
++               submit->signals[i].sync->type->wait(&device->vk,
++                  submit->signals[i].sync, submit->signals[i].signal_value,
++                  0, UINT64_MAX);
++      }
++
++      uint32_t remaining = va_job_count;
++      for (uint32_t i = 0; i < submit->command_buffer_count; i++) {
++         struct anv_cmd_buffer *cb = (struct anv_cmd_buffer *)submit->command_buffers[i];
++         for (uint32_t j = 0; j < cb->n_va_jobs; j++) {
++            ANV_FROM_HANDLE(anv_video_session, vid, cb->va_jobs[j].session);
++            remaining--;
++            const bool last = remaining == 0;
++            /* The first job carries the GPU wait: the worker processes jobs in
++             * order, so everything recorded in this submission is complete by
++             * the time the first one is encoded. */
++            struct vk_sync *gpu_sync = NULL;
++            if (va_sync && !va_deferred && j == 0)
++               gpu_sync = va_sync;
++            anv_va_submit_job(device, vid, &cb->va_jobs[j],
++                              (va_deferred && last) ? app_signal_count : 0,
++                              app_signals, gpu_sync,
++                              (va_deferred && last) ? va_sync : NULL);
++         }
++         cb->n_va_jobs = 0;
++      }
++      anv_va_log_submit(submit->wait_count, submit->signal_count,
++                        va_job_count, (os_time_get_nano() - t0) / 1e6);
++      return result;
++   }
++
+    return result;
+ }
+ 
+diff --git a/src/intel/vulkan/anv_cmd_buffer.c b/src/intel/vulkan/anv_cmd_buffer.c
+index 61e19de..9763879 100644
+--- a/src/intel/vulkan/anv_cmd_buffer.c
++++ b/src/intel/vulkan/anv_cmd_buffer.c
+@@ -132,6 +132,7 @@ anv_create_cmd_buffer(struct vk_command_pool *pool,
+ 
+    result = vk_command_buffer_init(pool, &cmd_buffer->vk,
+                                    &anv_cmd_buffer_ops, level);
++   cmd_buffer->n_va_jobs = 0;
+    if (result != VK_SUCCESS)
+       goto fail_alloc;
+ 
+@@ -330,6 +331,10 @@ anv_cmd_buffer_reset(struct vk_command_buffer *vk_cmd_buffer,
+ 
+    ANV_RMV(cmd_buffer_destroy, cmd_buffer->device, cmd_buffer);
+ 
++   /* Encode jobs belong to the recording that captured them; the application
++    * may reuse this command buffer for the next frame. */
++   cmd_buffer->n_va_jobs = 0;
++
+    reset_cmd_buffer(cmd_buffer, flags);
+ }
+ 
+diff --git a/src/intel/vulkan/anv_device.c b/src/intel/vulkan/anv_device.c
+index 58b7b36..b2f997a 100644
+--- a/src/intel/vulkan/anv_device.c
++++ b/src/intel/vulkan/anv_device.c
+@@ -30,6 +30,7 @@
+ #include <xf86drm.h>
+ 
+ #include "anv_private.h"
++#include "anv_va_encode.h"
+ #include "anv_measure.h"
+ #include "anv_shader.h"
+ #include "anv_slab_bo.h"
+@@ -1792,6 +1793,13 @@ VkResult anv_AllocateMemory(
+                       ANV_BO_ALLOC_COMPRESSED : 0;
+    }
+ 
++   /* Video encode images must be exportable so the VA-API backend can
++    * import their dma-buf (see anv_va_encode.c). */
++   if (image && (image->vk.usage &
++                 (VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR |
++                  VK_IMAGE_USAGE_VIDEO_ENCODE_DPB_BIT_KHR)))
++      alloc_flags |= ANV_BO_ALLOC_EXTERNAL;
++
+    /* Anything imported or exported is EXTERNAL */
+    if (mem->vk.export_handle_types || mem->vk.import_handle_type) {
+       alloc_flags |= ANV_BO_ALLOC_EXTERNAL;
+@@ -2115,6 +2123,19 @@ VkResult anv_MapMemory2(
+    }
+ 
+    assert(pMemoryMapInfo->size > 0);
++   /* How much of the buffer does the application actually map?  The vrlink
++    * hand-off writes packets at 0 / 4 M / 8 M into a 12 MB VkBuffer, but the
++    * third slot arrives at the client as zeros even though the driver's
++    * read-back proves the write landed.  Log the mapping the application asks
++    * for, so the limit is measured rather than assumed. */
++   if (pMemoryMapInfo->size >= (1024u * 1024u) && anv_va_verbose()) {
++      static int n_map;
++      if (n_map++ < 40)
++         anv_va_logf("mapmem: off=%llu size=%llu memsize=%llu",
++                     (unsigned long long) pMemoryMapInfo->offset,
++                     (unsigned long long) pMemoryMapInfo->size,
++                     (unsigned long long) mem->vk.size);
++   }
+    const VkDeviceSize offset = pMemoryMapInfo->offset;
+    const VkDeviceSize size =
+       vk_device_memory_range(&mem->vk, pMemoryMapInfo->offset,
+diff --git a/src/intel/vulkan/anv_image.c b/src/intel/vulkan/anv_image.c
+index 270f885..cb2d833 100644
+--- a/src/intel/vulkan/anv_image.c
++++ b/src/intel/vulkan/anv_image.c
+@@ -30,6 +30,7 @@
+ #include "drm-uapi/drm_fourcc.h"
+ 
+ #include "anv_private.h"
++#include "anv_va_encode.h"
+ #include "common/intel_aux_map.h"
+ #include "util/u_debug.h"
+ #include "vk_util.h"
+@@ -2729,6 +2730,42 @@ anv_image_get_memory_requirements(struct anv_device *device,
+       }
+    }
+ 
++   /* VA-API encode sources are handed to iHD through a dma-buf (see
++    * ~/bmg-shim/CHECKPOINT.md).  Only mappable memory types work reliably for
++    * that hand-off on this platform, so restrict the reported types to
++    * host-visible ones, preferring the device-local BAR type so the image
++    * stays in VRAM.  ANV_VA_NO_BAR=1 disables this for A/B testing.
++    */
++   if ((image->vk.usage & VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR) &&
++       !anv_va_staging_enabled() &&
++       getenv("ANV_VA_NO_BAR") == NULL) {
++      uint32_t pref = 0, host = 0;
++      for (uint32_t i = 0; i < device->physical->memory.type_count; i++) {
++         const VkMemoryPropertyFlags f =
++            device->physical->memory.types[i].propertyFlags;
++         if (!(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ||
++             !(memory_types & BITFIELD_BIT(i)))
++            continue;
++         host |= BITFIELD_BIT(i);
++         if (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
++            pref |= BITFIELD_BIT(i);
++      }
++      if (pref || host) {
++         const uint32_t chosen = pref ? pref : host;
++         static bool logged;
++         if (!logged && chosen != memory_types) {
++            logged = true;
++            FILE *f = fopen("/home/buchner/anv-va.log", "a");
++            if (f) {
++               fprintf(f, "ANV-VA: encode-src memory types 0x%x -> 0x%x (%s)\n",
++                       memory_types, chosen, pref ? "BAR" : "host");
++               fclose(f);
++            }
++         }
++         memory_types = chosen;
++      }
++   }
++
+    vk_foreach_struct(ext, pMemoryRequirements->pNext) {
+       switch (ext->sType) {
+       case VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS: {
+diff --git a/src/intel/vulkan/anv_physical_device.c b/src/intel/vulkan/anv_physical_device.c
+index 86a86f7..2eca528 100644
+--- a/src/intel/vulkan/anv_physical_device.c
++++ b/src/intel/vulkan/anv_physical_device.c
+@@ -183,9 +183,13 @@ get_device_extensions(const struct anv_physical_device *device,
+ {
+    const struct anv_instance *instance = device->instance;
+    const bool rt_enabled = ANV_SUPPORT_RT && device->info.has_ray_tracing;
+-   const bool hw_video_encode_supported = device->info.verx10 <= 125;
+-   const bool video_encode_enabled = hw_video_encode_supported &&
+-                                     ANV_DEBUG(VIDEO_ENCODE);
++   const bool hw_video_encode_supported =
++      device->info.verx10 <= 125 ||
++      device->info.platform == INTEL_PLATFORM_BMG;
++   const bool video_encode_enabled =
++      hw_video_encode_supported &&
++      (ANV_DEBUG(VIDEO_ENCODE) ||
++       device->info.platform == INTEL_PLATFORM_BMG);
+    const bool video_decode_enabled = ANV_DEBUG(VIDEO_DECODE);
+ 
+    *ext = (struct vk_device_extension_table) {
+@@ -2753,7 +2757,10 @@ anv_physical_device_init_queue_families(struct anv_physical_device *pdevice)
+             .engine_class = compute_class,
+          };
+       }
+-      if (v_count > 0 && (ANV_DEBUG(VIDEO_DECODE) || ANV_DEBUG(VIDEO_ENCODE))) {
++      const bool bmg_encode =
++         pdevice->info.platform == INTEL_PLATFORM_BMG;
++      if (v_count > 0 && (ANV_DEBUG(VIDEO_DECODE) ||
++                          ANV_DEBUG(VIDEO_ENCODE) || bmg_encode)) {
+          /* HEVC support on Gfx9 is only available on VCS0. So limit the number of video queues
+           * to the first VCS engine instance.
+           *
+@@ -2768,7 +2775,7 @@ anv_physical_device_init_queue_families(struct anv_physical_device *pdevice)
+          pdevice->queue.families[family_count++] = (struct anv_queue_family) {
+             .queueFlags = (ANV_DEBUG(VIDEO_DECODE) ?
+                            VK_QUEUE_VIDEO_DECODE_BIT_KHR : 0) |
+-                          (ANV_DEBUG(VIDEO_ENCODE) ?
++                          (ANV_DEBUG(VIDEO_ENCODE) || bmg_encode ?
+                            VK_QUEUE_VIDEO_ENCODE_BIT_KHR : 0),
+             .queueCount = pdevice->info.ver == 9 ? MIN2(1, v_count) : v_count,
+             .engine_class = INTEL_ENGINE_CLASS_VIDEO,
+diff --git a/src/intel/vulkan/anv_private.h b/src/intel/vulkan/anv_private.h
+index 3f60074..5315532 100644
+--- a/src/intel/vulkan/anv_private.h
++++ b/src/intel/vulkan/anv_private.h
+@@ -4930,6 +4930,35 @@ enum anv_cmd_buffer_exec_mode {
+ 
+ struct anv_measure_batch;
+ 
++struct anv_va_job {
++   VkVideoSessionKHR session;
++   VkImageView src_view;
++   VkBuffer dst_buffer;
++   VkDeviceSize dst_offset;
++   VkDeviceSize dst_range;
++   uint32_t width, height;
++   VkQueryPool query_pool;
++   uint32_t query_index;
++   /* Generation of this job's entry in the feedback table.  A job that used
++    * the same query slot earlier must not be able to publish its result into
++    * this job's entry (the application would then read, and send, the older
++    * frame's bitstream). */
++   uint32_t fb_gen;
++   /* Slice layout the application asked for
++    * (VkVideoEncodeH265PictureInfoKHR::naluSliceSegmentEntryCount). */
++   uint32_t app_slices;
++   /* Linear P010/NV12 staging buffer the source image is blitted into with
++    * anv_CmdCopyImageToMemoryKHR, then exported as a dma-buf for VA-API. */
++   VkBuffer linear_buf;
++   VkDeviceMemory linear_mem;
++   /* Extent/pitch of the staging copy (the coded extent, clamped to the
++    * image). */
++   uint32_t stage_w, stage_h, stage_pitch;
++   /* Set once the staging copy has been submitted (on the application's
++    * submit thread, before the encode job is handed to the worker). */
++   bool linear_copied;
++};
++
+ struct anv_cmd_buffer {
+    struct vk_command_buffer                     vk;
+ 
+@@ -5068,6 +5097,11 @@ struct anv_cmd_buffer {
+       struct vk_video_session_parameters *params;
+    } video;
+ 
++   struct anv_va_job va_jobs[8];
++   uint32_t n_va_jobs;
++   VkQueryPool va_query_pool;
++   uint32_t va_query_index;
++
+    /** List of anv_bvh_dump objects that get dumped on cmd buf completion */
+    struct list_head                            bvh_dumps;
+ 
+@@ -6947,6 +6981,8 @@ struct anv_vp9_last_frame_info {
+ struct anv_video_session {
+    struct vk_video_session vk;
+ 
++   void *va; /* anv_va_session, VA-API encode backend */
++
+    bool cdf_initialized;
+    VkVideoEncodeRateControlModeFlagBitsKHR rc_mode;
+ 
+diff --git a/src/intel/vulkan/anv_queue.c b/src/intel/vulkan/anv_queue.c
+index d19f824..8b96968 100644
+--- a/src/intel/vulkan/anv_queue.c
++++ b/src/intel/vulkan/anv_queue.c
+@@ -107,7 +107,8 @@ anv_queue_init(struct anv_device *device, struct anv_queue *queue,
+    }
+ 
+    if (queue_family->engine_class == INTEL_ENGINE_CLASS_COPY ||
+-       queue_family->engine_class == INTEL_ENGINE_CLASS_COMPUTE) {
++       queue_family->engine_class == INTEL_ENGINE_CLASS_COMPUTE ||
++       queue_family->engine_class == INTEL_ENGINE_CLASS_VIDEO) {
+       result = vk_sync_create(&device->vk,
+                               &device->physical->sync_syncobj_type,
+                               0, 0, &queue->companion_sync);
+diff --git a/src/intel/vulkan/anv_va_encode.c b/src/intel/vulkan/anv_va_encode.c
+new file mode 100644
+index 0000000..4765c15
+--- /dev/null
++++ b/src/intel/vulkan/anv_va_encode.c
+@@ -0,0 +1,3566 @@
++#include "anv_va_encode.h"
++#include <stdio.h>
++#include <fcntl.h>
++#include <stdlib.h>
++#include <unistd.h>
++
++static void va_stage_on_submit_thread(struct anv_device *device,
++                                      struct anv_va_job *job);
++static bool va_slice_layout_enabled(void);
++#include <errno.h>
++#include <string.h>
++#include <va/va.h>
++#include <va/va_drm.h>
++#include <va/va_drmcommon.h>
++#include <va/va_enc_hevc.h>
++#include <libdrm/drm_fourcc.h>
++#include <xf86drm.h>
++#include <linux/dma-buf.h>
++#include <sys/ioctl.h>
++#include <poll.h>
++#include "util/cache_ops.h"
++#include "util/os_time.h"
++#include <pthread.h>
++#include <stdarg.h>
++#include <stdarg.h>
++
++
++static int64_t va_t0(void)
++{
++   static int64_t t0;
++   if (!t0) t0 = os_time_get_nano();
++   return t0;
++}
++
++/* ANV_VA_LOG lets a test process (the harness) keep a log of its own instead
++ * of interleaving with the live vrserver. */
++static const char *va_log_path(void)
++{
++   static const char *path;
++   if (!path) {
++      path = getenv("ANV_VA_LOG");
++      if (!path || !*path)
++         path = "/tmp/anv-va.log";
++   }
++   return path;
++}
++
++#define VLOG(...) do { \
++   FILE *f_ = fopen(va_log_path(), "a"); \
++   if (f_) { fprintf(f_, "ANV-VA: [%6.0f] ", \
++                     (os_time_get_nano() - va_t0()) / 1e6); \
++             fprintf(f_, __VA_ARGS__); \
++             fputc('\n', f_); fclose(f_); } \
++} while (0)
++
++static bool va_env_flag(const char *name)
++{
++   const char *v = getenv(name);
++   return v && *v && strcmp(v, "0") != 0;
++}
++static uint32_t va_env_u32(const char *name, uint32_t def)
++{
++   const char *v = getenv(name);
++   return v && *v ? (uint32_t) strtoul(v, NULL, 0) : def;
++}
++static uint64_t va_env_u64(const char *name, uint64_t def)
++{
++   const char *v = getenv(name);
++   return v && *v ? (uint64_t) strtoull(v, NULL, 0) : def;
++}
++static double va_env_double(const char *name, double def)
++{
++   const char *v = getenv(name);
++   return v && *v ? atof(v) : def;
++}
++static bool va_verbose(void)
++{
++   static int v = -1;
++   if (v < 0)
++      v = va_env_flag("ANV_VA_VERBOSE") || va_env_flag("ANV_VA_DEBUG");
++   return v;
++}
++#define VLOGV(...) do { if (va_verbose()) VLOG(__VA_ARGS__); } while (0)
++
++/* Encoder options that trade bitstream robustness for packetized transfer.
++ * Read from ANV_VA_* environment variables.  They must be in the environment
++ * of the process that loads the ICD (SteamVR/vrserver), so a change takes
++ * effect after a SteamVR restart; /tmp is only used for debug output.
++ *   ANV_VA_SLICES     slices per frame (smaller loss units)
++ *   ANV_VA_TILES      "CxR" tile columns x rows (independent CTU groups)
++ *   ANV_VA_MAXFRAME   max frame size in bytes (bounds the on-wire burst)
++ *   ANV_VA_AUD        presence adds access unit delimiters (frame framing)
++ *   ANV_VA_BITRATE    bitrate cap in bit/s (smaller frames/bursts)
++ */
++struct va_enc_opts {
++   uint32_t slices, tile_cols, tile_rows, max_frame_size, aud;
++   uint64_t bitrate_cap;
++   /* Rate control: 0 = follow the application (CBR), 1 = constant QP.
++    * CQP is the default because vrlink's target swings by more than 4x, which
++    * makes a CBR encoder swing in quality (visible macroblocks/ringing). */
++   uint32_t cqp;
++   uint32_t qp;
++   /* QP limits carried in the per-frame VAEncMiscParameterRateControl.
++    * 0 = no limit, which is what the stream was validated with.  They are
++    * the knobs that bound how far iHD's rate controller may swing, so the
++    * delivered/requested ratio can be traded against quality without a
++    * rebuild: ANV_VA_MINQP, ANV_VA_MAXQP. */
++   uint32_t min_qp, max_qp;
++   /* Rate-control deadband (percent of the applied rate) and the VBV floor in
++    * frames, from ANV_VA_RC_DEADBAND / ANV_VA_VBV_FRAMES. */
++   uint32_t rc_deadband, vbv_frames;
++   /* Honour the application's slice boundaries (the default). */
++   uint32_t slice_layout;
++   /* Optional quality floor as bits per pixel of the encoded stream.  Off by
++    * default - the application's rate control is the envelope - and only set
++    * from ANV_VA_BPP_FLOOR (or ANV_VA_BPP) if a floor is ever wanted. */
++   double bpp_floor;
++};
++
++static bool va_enc_opts_equal(const struct va_enc_opts *a,
++                              const struct va_enc_opts *b)
++{
++   return a->slices == b->slices && a->tile_cols == b->tile_cols &&
++          a->tile_rows == b->tile_rows && a->max_frame_size == b->max_frame_size &&
++          a->aud == b->aud && a->bitrate_cap == b->bitrate_cap &&
++          a->cqp == b->cqp && a->qp == b->qp &&
++          a->min_qp == b->min_qp && a->max_qp == b->max_qp &&
++          a->rc_deadband == b->rc_deadband && a->vbv_frames == b->vbv_frames &&
++          a->bpp_floor == b->bpp_floor &&
++          a->slice_layout == b->slice_layout;
++}
++
++static struct va_enc_opts va_enc_opts_read(void)
++{
++   struct va_enc_opts o = { .slices = 1 };
++   const uint32_t app_slices = anv_va_app_slices();
++   if (app_slices)
++      o.slices = app_slices;
++   o.slices = va_env_u32("ANV_VA_SLICES", o.slices);
++   if (o.slices < 1) o.slices = 1;
++   if (o.slices > 32) o.slices = 32;
++   const char *tiles = getenv("ANV_VA_TILES");
++   if (tiles) {
++      unsigned c = 0, r = 0;
++      if (sscanf(tiles, "%ux%u", &c, &r) == 2) { o.tile_cols = c; o.tile_rows = r; }
++   }
++   o.max_frame_size = va_env_u32("ANV_VA_MAXFRAME", 0);
++   o.bitrate_cap = va_env_u64("ANV_VA_BITRATE", 0);
++   if (o.bitrate_cap < 1000000)
++      o.bitrate_cap = 0;
++   o.aud = va_env_flag("ANV_VA_AUD");
++   o.slice_layout = va_slice_layout_enabled();
++   o.bpp_floor = va_env_double("ANV_VA_BPP_FLOOR", 0);
++   if (!(o.bpp_floor > 0 && o.bpp_floor <= 4))
++      o.bpp_floor = va_env_double("ANV_VA_BPP", 0);
++   if (!(o.bpp_floor > 0 && o.bpp_floor <= 4))
++      o.bpp_floor = 0;
++   o.cqp = va_env_flag("ANV_VA_CQP");
++   o.qp = va_env_u32("ANV_VA_QP", 24);
++   if (o.qp < 1 || o.qp > 51) o.qp = 24;
++   o.min_qp = va_env_u32("ANV_VA_MINQP", 0);
++   if (o.min_qp > 51) o.min_qp = 0;
++   o.max_qp = va_env_u32("ANV_VA_MAXQP", 0);
++   if (o.max_qp > 51) o.max_qp = 0;
++   o.rc_deadband = va_env_u32("ANV_VA_RC_DEADBAND", 5);
++   if (o.rc_deadband > 50) o.rc_deadband = 5;
++   o.vbv_frames = va_env_u32("ANV_VA_VBV_FRAMES", 4);
++   if (o.vbv_frames > 32) o.vbv_frames = 4;
++   return o;
++}
++
++/* ==== Direct libva encode backend ========================================
++ *
++ * ANV has no native Vulkan H.265 encode implementation.  This file implements
++ * the Vulkan video encode entry points on top of libva/iHD: session parameters
++ * and packed headers, source-image import, the per-frame encode, the
++ * destination slots and the encode-feedback queries.  The rate-control, slice
++ * and packed-header parameter buffers are built per frame so the application's
++ * requests are honoured without reopening the encoder.
++ */
++#define VA_RECON_SURFACES  4
++#define VA_CODED_BUFFERS   2
++#define VA_MAX_SLICES      32
++
++/* HEVC constants used by the parameter buffers. */
++#define VA_HEVC_NAL_IDR_W_RADL 19
++#define VA_HEVC_SLICE_I         2
++#define VA_HEVC_INIT_QP        30   /* init_qp_minus26 = 4, as iHD accepted */
++#define VA_HEVC_DIFF_CU_QP      3
++
++struct anv_va_session {
++   VkFormat fmt;
++   uint32_t w, h, fps;
++   /* Bit rate the encoder is being told to use, in bit/s.  Updated per frame
++    * from the application's VkVideoEncodeRateControlInfoKHR; nothing is
++    * cached inside a wrapper any more.  Mirrors g_stream.bitrate, kept per
++    * session so a context created later starts from the current target. */
++   uint64_t bitrate;
++   bool ten_bit;
++   bool ready;
++   /* Set once the application's own rate control has been adopted, so the
++    * first target after it appears is applied even if it is inside the
++    * deadband of the startup heuristic. */
++   bool rc_from_app;
++   uint32_t profile_idc;      /* HEVC general_profile_idc: 1 Main, 2 Main10 */
++   uint32_t va_profile;       /* VAProfileHEVCMain / VAProfileHEVCMain10 */
++   uint32_t rt_format;        /* VA_RT_FORMAT_YUV420 / _10 */
++   uint32_t fourcc;           /* VA_FOURCC_NV12 / VA_FOURCC_P010 */
++   uint32_t level_idc;
++   uint32_t rc_mode;          /* VA_RC_CBR or VA_RC_CQP */
++   uint32_t fixed_qp;         /* CQP only */
++   uint32_t max_frame_size;   /* 0 = not requested */
++   bool packed_headers;
++   bool sao, amp, temporal_mvp;
++   /* The VA-API display is shared by all three slot contexts: one
++    * vaInitialize, three VAConfigs/VAContexts.  Only the header-only session
++    * (created before a video session exists) owns its display; the set owns
++    * it once the first slot adopts that session. */
++   int drm_fd;                /* owned dup, only when owns_dpy */
++   VADisplay dpy;
++   bool owns_dpy;
++   VAConfigID cfg;
++   VAContextID ctx;
++   VASurfaceID recon[VA_RECON_SURFACES];
++   unsigned recon_pos;
++   VABufferID coded[VA_CODED_BUFFERS];
++   unsigned coded_pos;
++   size_t coded_size;
++   uint8_t *headers;          /* VPS + SPS + PPS, start codes included */
++   size_t headers_size;
++   struct va_enc_opts opts;
++   uint64_t frames;
++   /* Destination slot this context belongs to (0/1/2 = 0/4M/8M).  The
++    * application treats each 4 MB slot as its own region; see va_sessions. */
++   uint32_t slot;
++};
++
++/* One video session's encoder contexts, one per destination slot.
++ *
++ * The application's buffer is three 4 MB slots at 0 / 4 M / 8 M and it reads
++ * each slot as a separate region, not as "size bytes at offset".  A single
++ * context rotating 0/4M/8M does not hand the third slot over correctly (the
++ * frame written there reaches the client all-zero while the bytes are in
++ * memory), so each slot gets its own VAConfig/VAContext, its own recon
++ * surfaces, coded buffers and therefore its own rate controller.
++ *
++ * The parameter sets must stay identical across the three: the application
++ * gets VPS/SPS/PPS out of band from one of them and the client decodes all
++ * three streams against that copy.  backend_create() therefore clones the
++ * first session's configuration and headers into the others.
++ */
++#define VA_SLOT_COUNT 3
++#define VA_SLOT_BYTES (4u << 20)
++
++struct va_sessions {
++   VkFormat fmt;
++   uint32_t w, h;
++   /* One VA-API display for all three contexts (see struct anv_va_session). */
++   int drm_fd;
++   VADisplay dpy;
++   struct anv_va_session *slot[VA_SLOT_COUNT];
++   /* A slot whose session could not be created falls back to the primary
++    * session (single-session behaviour) instead of dropping frames. */
++   bool slot_failed[VA_SLOT_COUNT];
++};
++
++/* Feedback entries are written by the encode worker and read by the
++ * application (vkGetQueryPoolResults), possibly from another thread, so they
++ * are protected by a mutex and the reader can wait for the worker. */
++typedef struct {
++   VkQueryPool pool;
++   uint32_t index, off, size;
++   uint32_t gen;     /* generation of the job that owns this entry */
++   bool ready;
++} VaFeedback;
++static VaFeedback g_fb[4096];
++static int g_nfb;
++static uint32_t g_fb_gen;
++static pthread_mutex_t g_fb_lock = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t g_fb_cond = PTHREAD_COND_INITIALIZER;
++
++static VaFeedback *fb_find(VkQueryPool pool, uint32_t index)
++{
++   for (int i = 0; i < g_nfb; i++)
++      if (g_fb[i].pool == pool && g_fb[i].index == index)
++         return &g_fb[i];
++   if (g_nfb < 4096) {
++      g_fb[g_nfb] = (VaFeedback){ pool, index, 0, 0, 0, false };
++      return &g_fb[g_nfb++];
++   }
++   return NULL;
++}
++
++/* Generations make the hand-off to the application ordered.  The application
++ * reuses a small query ring, so the job that used slot K three frames ago can
++ * still be running when slot K is cleared for the current frame; before this,
++ * that older job's feedback_set() satisfied the application's wait, which then
++ * read (and transmitted) the *previous* frame's bitstream out of the
++ * destination buffer while the current one was being written into it. */
++static void feedback_set(VkQueryPool pool, uint32_t index, uint32_t gen,
++                         uint32_t off, uint32_t size) {
++   pthread_mutex_lock(&g_fb_lock);
++   VaFeedback *e = fb_find(pool, index);
++   if (e && e->gen == gen) {
++      e->off = off; e->size = size; e->ready = true;
++      pthread_cond_broadcast(&g_fb_cond);
++   } else if (e) {
++      static int stale;
++      if (stale++ < 20)
++         VLOG("feedback: dropped stale result for slot %u (gen %u, entry now %u)",
++              index, gen, e->gen);
++   }
++   pthread_mutex_unlock(&g_fb_lock);
++}
++
++static uint32_t feedback_clear(VkQueryPool pool, uint32_t index)
++{
++   pthread_mutex_lock(&g_fb_lock);
++   VaFeedback *e = fb_find(pool, index);
++   uint32_t gen = ++g_fb_gen;
++   if (e) { e->gen = gen; e->ready = false; e->off = 0; e->size = 0; }
++   pthread_mutex_unlock(&g_fb_lock);
++   return gen;
++}
++
++/* Block until the encode worker published the packet for this query, so the
++ * application can keep using vkQueueSubmit asynchronously. */
++bool anv_va_verbose(void)
++{
++   return va_verbose();
++}
++
++bool anv_va_feedback_wait(VkQueryPool pool, uint32_t index, uint64_t timeout_ns)
++{
++   const int64_t t0 = os_time_get_nano();
++   struct timespec ts;
++   clock_gettime(CLOCK_REALTIME, &ts);
++   ts.tv_nsec += (long)(timeout_ns % 1000000000ull);
++   ts.tv_sec += (time_t)(timeout_ns / 1000000000ull);
++   if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
++
++   pthread_mutex_lock(&g_fb_lock);
++   VaFeedback *e = fb_find(pool, index);
++   bool ready = e && e->ready;
++   while (!ready) {
++      if (pthread_cond_timedwait(&g_fb_cond, &g_fb_lock, &ts) == ETIMEDOUT)
++         break;
++      ready = e && e->ready;
++   }
++   pthread_mutex_unlock(&g_fb_lock);
++   {
++      static int64_t last_log;
++      const double ms = (os_time_get_nano() - t0) / 1e6;
++      if (ms > 2.0 && (last_log == 0 || os_time_get_nano() - last_log > 200000000)) {
++         last_log = os_time_get_nano();
++         VLOG("feedback wait: application blocked %.1f ms (ready=%d)", ms, ready);
++      }
++   }
++   return ready;
++}
++
++static struct anv_va_session *va_pending;
++static VkFormat va_pending_fmt;
++static uint32_t va_pending_w, va_pending_h;
++
++
++/* Diagnostic: dump plane 0 of the encode source twice (before and after the
++ * encode) so we can tell whether the application is still writing it while we
++ * read it.  Only meaningful when the image is mappable (BAR memory). */
++static void va_dump_plane(struct anv_device *device, struct anv_address a,
++                          uint64_t bytes, const char *path)
++{
++   void *m = NULL;
++   if (anv_device_map_bo(device, a.bo, 0, a.bo->size, NULL, &m) != VK_SUCCESS) {
++      VLOG("dump map failed for %s", path);
++      return;
++   }
++   FILE *f = fopen(path, "wb");
++   if (f) { fwrite((char *)m + a.offset, 1, bytes, f); fclose(f); }
++   VLOG("dumped %s (%s)", path, f ? "ok" : "open failed");
++   anv_device_unmap_bo(device, a.bo, m, a.bo->size, false);
++}
++
++/* Deferred retirement of staging buffers.
++ *
++ * iHD imports the staging buffer's dma-buf into a VASurface and can keep that
++ * surface in its internal pool after we are done with the frame.  Freeing the
++ * BO immediately lets the next frame's allocation land on the same address
++ * (the two alternating pointers we see in the log), which is a use-after-free
++ * if iHD ever touches the surface again - and the symptom of that is a
++ * truncated last slice.  Keep the last VA_STAGE_RING buffers alive before
++ * releasing them, which gives the encoder ~100 ms at 90 fps to move on. */
++#define VA_STAGE_RING 8
++static struct {
++   VkBuffer buf;
++   VkDeviceMemory mem;
++} va_stage_ring[VA_STAGE_RING];
++static unsigned va_stage_pos;
++
++static void va_release_linear(struct anv_device *device, struct anv_va_job *job)
++{
++   VkDevice dev = anv_device_to_handle(device);
++   if (job->linear_buf == VK_NULL_HANDLE && job->linear_mem == VK_NULL_HANDLE)
++      return;
++
++   unsigned slot = va_stage_pos++ % VA_STAGE_RING;
++   if (va_stage_ring[slot].buf != VK_NULL_HANDLE)
++      anv_DestroyBuffer(dev, va_stage_ring[slot].buf, NULL);
++   if (va_stage_ring[slot].mem != VK_NULL_HANDLE)
++      anv_FreeMemory(dev, va_stage_ring[slot].mem, NULL);
++   va_stage_ring[slot].buf = job->linear_buf;
++   va_stage_ring[slot].mem = job->linear_mem;
++   job->linear_buf = VK_NULL_HANDLE;
++   job->linear_mem = VK_NULL_HANDLE;
++}
++
++/* Row pitch in bytes of the tightly packed P010/NV12 staging buffer. */
++static uint32_t va_tight_pitch(VkFormat fmt, uint32_t w)
++{
++   const uint32_t nplanes = vk_format_get_plane_count(fmt);
++   VkFormat f0 = vk_format_get_aspect_format(
++      fmt, nplanes > 1 ? VK_IMAGE_ASPECT_PLANE_0_BIT : VK_IMAGE_ASPECT_COLOR_BIT);
++   return w * vk_format_get_blocksize(f0);
++}
++
++/* Allocate an exportable linear staging buffer, bind it, and record a
++ * vkCmdCopyImageToMemoryKHR of the source image into it.  The buffer is
++ * exported as a dma-buf in anv_va_encode_job() and imported by VA-API as a
++ * plain linear P010/NV12 surface, so no tiled layout is ever assumed. */
++
++/* The VA encode blocks for ~10 ms per 1024x4096 frame (iHD is
++ * synchronous).  Doing that inside vkQueueSubmit stalls the application's
++ * submit thread and destroys frame pacing, so the jobs are handed to a
++ * single worker thread.  Encode order is preserved and the app's fence has
++ * already been waited for (the submitted batch only contains the video
++ * coding-scope commands), so the source image is complete when we read it. */
++/* Smallest VBV we will hand the encoder (see the rc_buffer_size comments). */
++#define ANV_VA_MIN_VBV (128 * 1024)
++
++/* The VBV must hold several whole frames, otherwise iHD stops in the middle of
++ * the last slice when a frame does not fit (the decoder conceals the rest).
++ * 128 KB was enough while frames were ~40 KB; with vrlink asking 82 Mbit/s at
++ * 90 fps a frame is ~114 KB and can reach 133 KB, so the floor has to follow
++ * the per-frame budget. */
++static int64_t va_vbv_floor(uint64_t bitrate, uint32_t fps)
++{
++   uint64_t frame = (bitrate && fps) ? bitrate / 8 / fps : 0;
++   uint64_t floor = frame * 4;
++   return floor > ANV_VA_MIN_VBV ? (int64_t) floor : (int64_t) ANV_VA_MIN_VBV;
++}
++
++#define VA_QUEUE_LEN 32
++
++struct va_pending_job {
++   int64_t t_enqueue;
++   struct anv_device *device;
++   struct anv_video_session *vid;
++   struct anv_va_job job;
++   uint32_t n_signals;
++   struct vk_sync_signal signals[8];
++   /* GPU sync the worker waits on before encoding (the submission that
++    * recorded the staging copy), destroyed by the worker. */
++   struct vk_sync *gpu_sync;
++   struct vk_sync *destroy_sync;
++};
++
++/* Frame-pacing probes (anv_va_encode.c diagnostics): written by the submit
++ * thread and the worker, read by the next submit. */
++static int64_t va_last_enqueue;
++static int64_t va_last_packet_done;
++
++/* One encode queue/worker for the device.  The three destination slots have
++ * their own VA contexts (see va_sessions); the worker serialises the frames,
++ * but the contexts are independent. */
++struct va_pool {
++   pthread_mutex_t lock;
++   pthread_cond_t not_empty;
++   pthread_cond_t not_full;
++   struct va_pending_job q[VA_QUEUE_LEN];
++   unsigned head, tail, count;
++   pthread_t thread;
++   bool started;
++};
++static struct va_pool va_pool = {
++   .lock = PTHREAD_MUTEX_INITIALIZER,
++   .not_empty = PTHREAD_COND_INITIALIZER,
++   .not_full = PTHREAD_COND_INITIALIZER,
++};
++
++/* ---- per-image encode overlap ------------------------------------------
++ * In the direct-export path iHD reads the application's image itself.  If the
++ * application submits the same image again before the previous encode has
++ * finished, the encoder reads a picture the GPU is already rewriting - the
++ * corruption the direct path shows and the staging path does not.  Track it
++ * per image pointer and log every overlap. */
++#define VA_INFLIGHT_MAX 8
++static struct {
++   const struct anv_image *img;
++   uint32_t n;
++   int64_t since;
++} g_img_inflight[VA_INFLIGHT_MAX];
++static pthread_mutex_t g_img_inflight_lock = PTHREAD_MUTEX_INITIALIZER;
++
++static void va_img_enter(const struct anv_image *img)
++{
++   if (!img)
++      return;
++   pthread_mutex_lock(&g_img_inflight_lock);
++   for (int i = 0; i < VA_INFLIGHT_MAX; i++) {
++      if (g_img_inflight[i].img == img) {
++         if (g_img_inflight[i].n) {
++            static int logged;
++            if (logged++ < 200)
++               VLOGV("IMAGE OVERLAP: img=%p submitted again with %u encode(s) "
++                    "still in flight (%.1f ms) - direct export reads a live "
++                    "image", (void *) img, g_img_inflight[i].n,
++                    (os_time_get_nano() - g_img_inflight[i].since) / 1e6);
++         } else {
++            g_img_inflight[i].since = os_time_get_nano();
++         }
++         g_img_inflight[i].n++;
++         pthread_mutex_unlock(&g_img_inflight_lock);
++         return;
++      }
++   }
++   for (int i = 0; i < VA_INFLIGHT_MAX; i++) {
++      if (!g_img_inflight[i].img || !g_img_inflight[i].n) {
++         g_img_inflight[i].img = img;
++         g_img_inflight[i].n = 1;
++         g_img_inflight[i].since = os_time_get_nano();
++         break;
++      }
++   }
++   pthread_mutex_unlock(&g_img_inflight_lock);
++}
++
++static void va_img_leave(const struct anv_image *img)
++{
++   if (!img)
++      return;
++   pthread_mutex_lock(&g_img_inflight_lock);
++   for (int i = 0; i < VA_INFLIGHT_MAX; i++)
++      if (g_img_inflight[i].img == img && g_img_inflight[i].n)
++         g_img_inflight[i].n--;
++   pthread_mutex_unlock(&g_img_inflight_lock);
++}
++
++static void *va_worker(void *arg)
++{
++   struct va_pool *pool = &va_pool;
++   (void) arg;
++   for (;;) {
++      pthread_mutex_lock(&pool->lock);
++      while (pool->count == 0)
++         pthread_cond_wait(&pool->not_empty, &pool->lock);
++      struct va_pending_job w = pool->q[pool->head];
++      pool->head = (pool->head + 1) % VA_QUEUE_LEN;
++      pool->count--;
++      pthread_cond_signal(&pool->not_full);
++      pthread_mutex_unlock(&pool->lock);
++      const int64_t t_deq = os_time_get_nano();
++
++      if (w.gpu_sync) {
++         /* The staging copy was recorded in the submission this sync stands
++          * for, so the buffer is complete once it signals. */
++         /* The frame's dma-buf carries the render fence, so if iHD honours
++          * implicit fencing the hardware can do this wait and the worker need
++          * not block.  ANV_VA_NO_CPU_WAIT=1 skips it to test exactly that. */
++         if (!va_env_flag("ANV_VA_NO_CPU_WAIT"))
++            vk_sync_wait(&w.device->vk, w.gpu_sync, 1, 0, UINT64_MAX);
++         vk_sync_destroy(&w.device->vk, w.gpu_sync);
++      }
++      anv_va_encode_job(w.device, w.vid, &w.job);
++      {
++         ANV_FROM_HANDLE(anv_image_view, iv2, w.job.src_view);
++         va_img_leave(iv2 ? iv2->image : NULL);
++      }
++   va_last_packet_done = os_time_get_nano();
++   {
++      static int64_t last_done;
++      char extra[64] = "";
++      if (last_done)
++         snprintf(extra, sizeof extra, ", gap since previous done %.1f ms",
++                  (va_last_packet_done - last_done) / 1e6);
++      last_done = va_last_packet_done;
++      /* Only when a frame is actually slow: this must not cost a log write
++       * per frame in the shipped build. */
++      if ((va_last_packet_done - w.t_enqueue) > 20000000)
++         VLOG("worker: queued->dequeue %.1f ms, dequeue->done %.1f ms, "
++              "back-to-app %.1f ms%s",
++              (t_deq - w.t_enqueue) / 1e6, (va_last_packet_done - t_deq) / 1e6,
++              (va_last_packet_done - w.t_enqueue) / 1e6, extra);
++   }
++      if (w.n_signals)
++         vk_sync_signal_many(&w.device->vk, w.n_signals, w.signals);
++      if (w.destroy_sync)
++         vk_sync_destroy(&w.device->vk, w.destroy_sync);
++   }
++   return NULL;
++}
++
++void anv_va_submit_job(struct anv_device *device,
++                       struct anv_video_session *vid,
++                       struct anv_va_job *job,
++                       uint32_t n_signals,
++                       const struct vk_sync_signal *signals,
++                       struct vk_sync *gpu_sync,
++                       struct vk_sync *destroy_sync)
++{
++   /* The encode takes ~6 ms; running it inline stalls the application's
++    * submit thread and delays its fence.  By default the work is handed to a
++    * worker thread and the application's signals (and the private sync the
++    * KMD signalled) are handled there.  vkGetQueryPoolResults waits for the
++    * packet, so the application still sees a ready feedback entry.
++    * ANV_VA_SYNC=1 restores the old fully synchronous behaviour. */
++   va_stage_on_submit_thread(device, job);
++   {   /* count this image as being encoded until the worker is done */
++      ANV_FROM_HANDLE(anv_image_view, iv, job->src_view);
++      va_img_enter(iv ? iv->image : NULL);
++   }
++
++   if (va_env_flag("ANV_VA_SYNC")) {
++      if (gpu_sync) {
++         if (!va_env_flag("ANV_VA_NO_CPU_WAIT"))
++            vk_sync_wait(&device->vk, gpu_sync, 1, 0, UINT64_MAX);
++         vk_sync_destroy(&device->vk, gpu_sync);
++      }
++      anv_va_encode_job(device, vid, job);
++      if (n_signals && vk_sync_signal_many(&device->vk, n_signals, signals) != VK_SUCCESS)
++         VLOG("signalling the application's syncs failed");
++      if (destroy_sync)
++         vk_sync_destroy(&device->vk, destroy_sync);
++      return;
++   }
++
++   struct va_pool *pool = &va_pool;
++   pthread_mutex_lock(&pool->lock);
++   if (!pool->started) {
++      pthread_create(&pool->thread, NULL, va_worker, NULL);
++      pool->started = true;
++   }
++   while (pool->count == VA_QUEUE_LEN)
++      pthread_cond_wait(&pool->not_full, &pool->lock);
++   job->fb_gen = feedback_clear(job->query_pool, job->query_index);
++   struct va_pending_job *w = &pool->q[pool->tail];
++   memset(w, 0, sizeof(*w));
++   w->t_enqueue = os_time_get_nano();
++   {   /* Frame pacing: how often the application hands us a frame, and how
++        * long after the previous packet it does so.  "back" is the number that
++        * decides whether the 100 ms frame period is ours or the app's. */
++      if (va_last_enqueue) {
++         const double gap = (w->t_enqueue - va_last_enqueue) / 1e6;
++         const double back = va_last_packet_done ?
++            (w->t_enqueue - va_last_packet_done) / 1e6 : -1;
++         if (gap > 20.0)
++            VLOG("pacing: %.1f ms since the previous frame (%.1f ms after the "
++                 "previous packet was ready)", gap, back);
++      }
++      va_last_enqueue = w->t_enqueue;
++   }
++   w->device = device; w->vid = vid; w->job = *job;
++   w->gpu_sync = gpu_sync;
++   w->n_signals = n_signals < 8 ? n_signals : 8;
++   for (uint32_t i = 0; i < w->n_signals; i++)
++      w->signals[i] = signals[i];
++   w->destroy_sync = destroy_sync;
++   pool->tail = (pool->tail + 1) % VA_QUEUE_LEN;
++   pool->count++;
++   pthread_cond_signal(&pool->not_empty);
++   pthread_mutex_unlock(&pool->lock);
++}
++
++void anv_va_log_imgwrite(const void *img, int old_layout, int new_layout,
++                         uint64_t dst_stage, uint64_t dst_access)
++{
++   static int n;
++   if (n++ > 400)
++      return;
++   VLOG("imgwrite img=%p old=%d new=%d dstStage=0x%llx dstAccess=0x%llx",
++        img, old_layout, new_layout,
++        (unsigned long long)dst_stage, (unsigned long long)dst_access);
++}
++
++void anv_va_log_msg(const char *msg)
++{
++   static int n;
++   if (n++ < 20)
++      VLOG("%s", msg);
++}
++
++/* Record the slice layout the application asked for, so we can (a) drive the
++ * encoder with it and (b) check whether the produced bitstream matches. */
++static uint32_t g_app_slices;
++static uint32_t g_app_slice_addr[16];
++static uint32_t g_app_slice_addr_count;
++
++void anv_va_note_slices(uint32_t count, const uint32_t *addresses, uint32_t n_addr)
++{
++   const uint32_t n = MIN2(n_addr, ARRAY_SIZE(g_app_slice_addr));
++   bool changed = count != g_app_slices;
++   for (uint32_t i = 0; i < n && !changed; i++)
++      changed = addresses[i] != g_app_slice_addr[i];
++   g_app_slices = count;
++   g_app_slice_addr_count = n;
++   for (uint32_t i = 0; i < n; i++)
++      g_app_slice_addr[i] = addresses[i];
++   if (changed) {
++      char buf[256];
++      size_t off = 0;
++      off += snprintf(buf + off, sizeof buf - off,
++                      "app asks for %u slice(s), segment addresses:", count);
++      for (uint32_t i = 0; i < n && off + 12 < sizeof buf; i++)
++         off += snprintf(buf + off, sizeof buf - off, " %u", addresses[i]);
++      VLOG("%s", buf);
++   }
++}
++
++uint32_t anv_va_app_slices(void)
++{
++   return g_app_slices;
++}
++
++void anv_va_logf(const char *fmt, ...)
++{
++   FILE *f = fopen(va_log_path(), "a");
++   if (!f)
++      return;
++   fprintf(f, "ANV-VA: [%6.0f] ", (os_time_get_nano() - va_t0()) / 1e6);
++   va_list ap;
++   va_start(ap, fmt);
++   vfprintf(f, fmt, ap);
++   va_end(ap);
++   fputc('\n', f);
++   fclose(f);
++}
++
++void anv_va_log_submit(uint32_t waits, uint32_t signals, uint32_t jobs,
++                       double ms)
++{
++   static int g_n;
++   if (g_n++ > 200)
++      return;
++   VLOGV("submit waits=%u signals=%u jobs=%u hook=%.2fms", waits, signals, jobs, ms);
++}
++
++
++/* Fallback (ANV_VA_STAGE_COMPUTE=1): copy the tiled encode source into the
++ * linear staging buffer with a separate batch on a compute capable queue.
++ *
++ * The default path does not use this: it records the copy in the application's
++ * own video command buffer (see anv_va_prepare_linear()), which is what makes
++ * the encoder see the image exactly at the point in the application's command
++ * stream where the application asked for it to be encoded. */
++static bool va_gpu_copy_linear(struct anv_device *device,
++                               const struct anv_image *src,
++                               struct anv_va_job *job)
++{
++   struct anv_queue *q = NULL;
++   for (uint32_t i = 0; i < device->queue_count; i++) {
++      const uint32_t fam = device->queues[i].vk.queue_family_index;
++      const VkQueueFlags f = device->physical->queue.families[fam].queueFlags;
++      if (f & VK_QUEUE_VIDEO_ENCODE_BIT_KHR)
++         continue;
++      if (f & VK_QUEUE_COMPUTE_BIT) {
++         q = &device->queues[i];
++         break;
++      }
++   }
++   if (!q) { VLOG("no compute queue for the staging copy"); return false; }
++
++   VkDevice dev = anv_device_to_handle(device);
++   const uint32_t fam = q->vk.queue_family_index;
++
++   static VkCommandPool pool = VK_NULL_HANDLE;
++   static uint32_t pool_family = UINT32_MAX;
++   if (pool == VK_NULL_HANDLE || pool_family != fam) {
++      VkCommandPoolCreateInfo pci = {
++         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
++         .queueFamilyIndex = fam,
++      };
++      pool = VK_NULL_HANDLE;
++      if (device->vk.dispatch_table.CreateCommandPool(dev, &pci, NULL, &pool) != VK_SUCCESS) {
++         VLOG("staging pool create failed");
++         return false;
++      }
++      pool_family = fam;
++   }
++
++   VkCommandBufferAllocateInfo cbi = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
++      .commandPool = pool,
++      .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
++      .commandBufferCount = 1,
++   };
++   VkCommandBuffer cmd = VK_NULL_HANDLE;
++   if (device->vk.dispatch_table.AllocateCommandBuffers(dev, &cbi, &cmd) != VK_SUCCESS) return false;
++
++   const uint32_t w = job->width ? job->width : src->vk.extent.width;
++   const uint32_t h = job->height ? job->height : src->vk.extent.height;
++   const uint32_t nplanes = vk_format_get_plane_count(src->vk.format);
++   const bool multi = nplanes > 1;
++   const uint32_t pitch = va_tight_pitch(src->vk.format, w);
++   const VkDeviceSize luma = (VkDeviceSize)pitch * h;
++   /* Derive the chroma extent from the format instead of assuming 4:2:0. */
++   const uint32_t cw = multi ? vk_format_get_plane_width(src->vk.format, 1, w) : w;
++   const uint32_t ch = multi ? vk_format_get_plane_height(src->vk.format, 1, h) : h;
++   const VkDeviceSize chroma = multi ? (VkDeviceSize)pitch * ch : 0;
++
++   ANV_FROM_HANDLE(anv_buffer, lbuf, job->linear_buf);
++   const uint64_t addr = anv_address_physical(lbuf->address);
++
++   VkCommandBufferBeginInfo bi = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++      .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
++   };
++   device->vk.dispatch_table.BeginCommandBuffer(cmd, &bi);
++
++
++   VkDeviceMemoryImageCopyKHR regions[2];
++   memset(regions, 0, sizeof regions);
++   for (unsigned r = 0; r < (multi ? 2u : 1u); r++) {
++      regions[r].sType = VK_STRUCTURE_TYPE_DEVICE_MEMORY_IMAGE_COPY_KHR;
++      regions[r].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
++      regions[r].imageSubresource.layerCount = 1;
++   }
++   regions[0].addressRange.address = addr;
++   regions[0].addressRange.size = luma;
++   regions[0].imageSubresource.aspectMask =
++      multi ? VK_IMAGE_ASPECT_PLANE_0_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
++   regions[0].imageExtent = (VkExtent3D){ w, h, 1 };
++   if (multi) {
++      regions[1].addressRange.address = addr + luma;
++      regions[1].addressRange.size = chroma;
++      regions[1].imageSubresource.aspectMask = VK_IMAGE_ASPECT_PLANE_1_BIT;
++      regions[1].imageExtent = (VkExtent3D){ cw, ch, 1 };
++   }
++   VkCopyDeviceMemoryImageInfoKHR info = {
++      .sType = VK_STRUCTURE_TYPE_COPY_DEVICE_MEMORY_IMAGE_INFO_KHR,
++      .image = anv_image_to_handle((struct anv_image *)src),
++      .regionCount = multi ? 2 : 1,
++      .pRegions = regions,
++   };
++   anv_CmdCopyImageToMemoryKHR(cmd, &info);
++   device->vk.dispatch_table.EndCommandBuffer(cmd);
++
++   static VkFence fence = VK_NULL_HANDLE;
++   static bool fence_used;
++   if (fence == VK_NULL_HANDLE) {
++      VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
++      if (device->vk.dispatch_table.CreateFence(dev, &fci, NULL, &fence) != VK_SUCCESS) return false;
++   } else if (fence_used) {
++      device->vk.dispatch_table.ResetFences(dev, 1, &fence);
++   }
++   fence_used = true;
++   VkSubmitInfo si = {
++      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++      .commandBufferCount = 1,
++      .pCommandBuffers = &cmd,
++   };
++   VkResult r = device->vk.dispatch_table.QueueSubmit(vk_queue_to_handle(&q->vk),
++                                                     1, &si, fence);
++   if (r == VK_SUCCESS)
++      r = device->vk.dispatch_table.WaitForFences(dev, 1, &fence, true, UINT64_MAX);
++   device->vk.dispatch_table.FreeCommandBuffers(dev, pool, 1, &cmd);
++   if (r != VK_SUCCESS) { VLOG("staging copy submit/wait failed %d", r); return false; }
++   return true;
++}
++
++/* Run the staging copy on the application's submit thread: submitting and
++ * waiting for our own batch from the encode worker is not safe. */
++static void va_stage_on_submit_thread(struct anv_device *device,
++                                      struct anv_va_job *job)
++{
++   if (job->linear_buf == VK_NULL_HANDLE || job->linear_copied)
++      return;
++   ANV_FROM_HANDLE(anv_image_view, iv, job->src_view);
++   if (!iv) return;
++   const struct anv_image *img = iv->image;
++   if (!img) return;
++   job->linear_copied = va_gpu_copy_linear(device, img, job);
++}
++
++/* 64-bit FNV-1a.  Used to prove, per frame, that the bytes the application
++ * puts on the wire are the bytes this driver wrote into its destination
++ * buffer: the packet line carries the hash of exactly what was memcpy'd. */
++static uint64_t va_hash64(const void *p, size_t n)
++{
++   const uint8_t *b = p;
++   uint64_t h = 1469598103934665603ull;
++   for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ull; }
++   return h;
++}
++
++/* Pair capture (/tmp/va_pair_enable): dump the atlas exactly as the encoder
++ * receives it (8-bit luma PGM) so it can be compared with the decoded packet of
++ * the same frame.  This separates "app/copy produced stale tiles" from
++ * "encoder displaced tiles". */
++static void va_pair_dump_src(struct anv_device *device, struct anv_buffer *lbuf,
++                             uint32_t w, uint32_t h, uint32_t pitch, int idx)
++{
++   void *map = NULL;
++   if (anv_device_map_bo(device, lbuf->address.bo, 0, lbuf->address.bo->size,
++                         NULL, &map) != VK_SUCCESS || !map)
++      return;
++   const uint8_t *base = (const uint8_t *) map + lbuf->address.offset;
++   char path[64];
++   snprintf(path, sizeof path, "/tmp/va_pair_%03d_src.pgm", idx);
++   FILE *f = fopen(path, "wb");
++   if (f) {
++      /* Quarter-resolution luma (256x1024): a full 1024x4096 dump per frame
++       * is 4 MB and stalled the stream (be0cbae0); this is 256 KB. */
++      const uint32_t sw = (w + 3) / 4, sh = (h + 3) / 4;
++      fprintf(f, "P5\n%u %u\n255\n", sw, sh);
++      uint8_t *line = malloc(sw);
++      for (uint32_t y = 0; y < h && line; y += 4) {
++         const uint16_t *row = (const uint16_t *) (base + (size_t) y * pitch);
++         for (uint32_t x = 0; x < sw; x++)
++            line[x] = (uint8_t) (row[x * 4] >> 8);
++         fwrite(line, 1, sw, f);
++      }
++      free(line);
++      fclose(f);
++   }
++   anv_device_unmap_bo(device, lbuf->address.bo, map, lbuf->address.bo->size, false);
++}
++
++/* Verification aid: with /tmp/va_dumplinear_enable present, log where the
++ * staging copy put data (nonzero dword count over the first MiB and a few
++ * sample pixels), so a wrong/empty copy is visible without decoding. */
++static void va_check_linear(struct anv_device *device, struct anv_buffer *lbuf,
++                            uint32_t w, uint32_t h, uint32_t pitch)
++{
++   if (!va_env_flag("ANV_VA_DUMP_LINEAR"))
++      return;
++   void *map = NULL;
++   if (anv_device_map_bo(device, lbuf->address.bo, 0, lbuf->address.bo->size,
++                         NULL, &map) != VK_SUCCESS || !map)
++      return;
++   const uint8_t *base = (const uint8_t *) map + lbuf->address.offset;
++   const size_t scan = MIN2((size_t) pitch * h, 1024 * 1024) / 4;
++   size_t nz = 0;
++   for (size_t i = 0; i < scan; i++)
++      nz += ((const uint32_t *) base)[i] != 0;
++   const uint16_t *row = (const uint16_t *) (base + (size_t) pitch * 100);
++   anv_va_logf("staged %ux%u pitch=%u nonzero=%zu row100=%04x %04x %04x %04x",
++               w, h, pitch, nz, row[0], row[1], row[2], row[3]);
++   anv_device_unmap_bo(device, lbuf->address.bo, map, lbuf->address.bo->size, false);
++}
++
++/* Whether the tiled encode source is copied into a linear staging buffer
++ * before it is handed to VA-API.  When it is, the image itself is never
++ * exported and can live in plain VRAM; when it is not, the image is exported
++ * with its modifier and must be mappable (BAR) memory.
++ *
++ * ANV_VA_NO_STAGE=1 (or /tmp/va_no_stage_enable) selects the direct export. */
++bool anv_va_staging_enabled(void)
++{
++   /* Staging (blit the image into a linear BAR buffer) is OFF by default:
++    * exporting the image's own dma-buf costs no 12 MB/frame PCIe copy and
++    * measured better on both axes.  Opt back in with ANV_VA_STAGE=1. */
++   static int enabled = -1;
++   if (enabled < 0)
++      enabled = va_env_flag("ANV_VA_STAGE");
++   return enabled;
++}
++
++/* The dma-buf is consumed by iHD through a PRIME import.  Only mappable
++ * memory works for that hand-off on this platform (see CHECKPOINT.md), so
++ * prefer the device-local BAR type over plain VRAM, exactly like the encode
++ * image's memory requirement restriction in anv_image.c. */
++static uint32_t va_pick_memory_type(struct anv_device *device, uint32_t types)
++{
++   uint32_t pref = 0, host = 0;
++   for (uint32_t i = 0; i < device->physical->memory.type_count; i++) {
++      if (!(types & BITFIELD_BIT(i)))
++         continue;
++      const VkMemoryPropertyFlags f =
++         device->physical->memory.types[i].propertyFlags;
++      if (!(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
++         continue;
++      host |= BITFIELD_BIT(i);
++      if (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
++         pref |= BITFIELD_BIT(i);
++   }
++   const uint32_t chosen = pref ? pref : host ? host : types;
++   return __builtin_ctz(chosen);
++}
++
++void anv_va_prepare_linear(struct anv_cmd_buffer *cmd_buffer,
++                          const struct anv_image *src,
++                          struct anv_va_job *job) {
++   if (job->linear_buf != VK_NULL_HANDLE) return;
++
++   /* A linear source can be exported to VA-API as-is. */
++   if (src->planes[0].primary_surface.isl.tiling == ISL_TILING_LINEAR)
++      return;
++
++   /* Without staging the tiled image is exported to VA-API with its modifier,
++    * which requires mappable (BAR) image memory (see anv_image.c). */
++   if (!anv_va_staging_enabled()) {
++      VLOG("tiled source (tiling=%d), staging disabled - exporting as-is",
++           src->planes[0].primary_surface.isl.tiling);
++      return;
++   }
++
++   struct anv_device *device = cmd_buffer->device;
++   VkDevice dev = anv_device_to_handle(device);
++
++   uint32_t w = job->width ? job->width : src->vk.extent.width;
++   uint32_t h = job->height ? job->height : src->vk.extent.height;
++   w = MIN2(w, src->vk.extent.width);
++   h = MIN2(h, src->vk.extent.height);
++
++   const uint32_t nplanes = vk_format_get_plane_count(src->vk.format);
++   const bool multi = nplanes > 1;
++   const VkImageAspectFlags aspect0 =
++      multi ? VK_IMAGE_ASPECT_PLANE_0_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
++   const uint32_t pitch = va_tight_pitch(src->vk.format, w);
++   const VkDeviceSize luma = (VkDeviceSize)pitch * h;
++   /* Derive the chroma extent from the format instead of assuming 4:2:0. */
++   const uint32_t cw = multi ? vk_format_get_plane_width(src->vk.format, 1, w) : w;
++   const uint32_t ch = multi ? vk_format_get_plane_height(src->vk.format, 1, h) : h;
++   const VkDeviceSize chroma = multi ? (VkDeviceSize)pitch * ch : 0;
++
++   job->stage_w = w;
++   job->stage_h = h;
++   job->stage_pitch = pitch;
++
++   VkBufferCreateInfo bci = {0};
++   bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
++   bci.size = luma + chroma;
++   bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
++   bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++   VkExternalMemoryBufferCreateInfo bext = {0};
++   bext.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
++   bext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++   bci.pNext = &bext;
++   if (anv_CreateBuffer(dev, &bci, NULL, &job->linear_buf) != VK_SUCCESS) {
++      VLOG("linear CreateBuffer failed"); job->linear_buf = VK_NULL_HANDLE; return;
++   }
++
++   VkBufferMemoryRequirementsInfo2 req = {0};
++   req.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2;
++   req.buffer = job->linear_buf;
++   VkMemoryRequirements2 mr = {0};
++   mr.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2;
++   device->vk.dispatch_table.GetBufferMemoryRequirements2(dev, &req, &mr);
++
++   VkMemoryAllocateInfo ai = {0};
++   ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++   ai.allocationSize = mr.memoryRequirements.size;
++   ai.memoryTypeIndex = va_pick_memory_type(device,
++                                            mr.memoryRequirements.memoryTypeBits);
++   VkExportMemoryAllocateInfo exp = {0};
++   exp.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
++   exp.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++   ai.pNext = &exp;
++   if (anv_AllocateMemory(dev, &ai, NULL, &job->linear_mem) != VK_SUCCESS) {
++      VLOG("linear AllocateMemory failed");
++      anv_DestroyBuffer(dev, job->linear_buf, NULL);
++      job->linear_buf = VK_NULL_HANDLE; return;
++   }
++
++   VkBindBufferMemoryInfo bind = {0};
++   bind.sType = VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO;
++   bind.buffer = job->linear_buf;
++   bind.memory = job->linear_mem;
++   bind.memoryOffset = 0;
++   anv_BindBufferMemory2(dev, 1, &bind);
++
++   ANV_FROM_HANDLE(anv_buffer, lbuf, job->linear_buf);
++   const uint64_t addr = anv_address_physical(lbuf->address);
++   VLOG("staging bo=%p gem=%u flags=0x%x addr=0x%llx",
++        (void *) lbuf->address.bo, lbuf->address.bo->gem_handle,
++        (unsigned) lbuf->address.bo->alloc_flags, (unsigned long long) addr);
++
++   VkDeviceMemoryImageCopyKHR regions[2];
++   memset(regions, 0, sizeof regions);
++   for (unsigned r = 0; r < (multi ? 2u : 1u); r++) {
++      regions[r].sType = VK_STRUCTURE_TYPE_DEVICE_MEMORY_IMAGE_COPY_KHR;
++      regions[r].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
++      regions[r].imageSubresource.layerCount = 1;
++   }
++   regions[0].addressRange.address = addr;
++   regions[0].addressRange.size = luma;
++   regions[0].imageSubresource.aspectMask = aspect0;
++   regions[0].imageExtent = (VkExtent3D){ w, h, 1 };
++   if (multi) {
++      regions[1].addressRange.address = addr + luma;
++      regions[1].addressRange.size = chroma;
++      regions[1].imageSubresource.aspectMask = VK_IMAGE_ASPECT_PLANE_1_BIT;
++      regions[1].imageExtent = (VkExtent3D){ cw, ch, 1 };
++   }
++
++   VkCopyDeviceMemoryImageInfoKHR info = {
++      .sType = VK_STRUCTURE_TYPE_COPY_DEVICE_MEMORY_IMAGE_INFO_KHR,
++      .image = anv_image_to_handle((struct anv_image *)src),
++      .regionCount = multi ? 2 : 1,
++      .pRegions = regions,
++   };
++
++   /* The copy is recorded in the application's own video command buffer and
++    * runs on that queue's RCS companion (the video engines cannot run BLORP).
++    * No wait is emitted in the video batch: anv_queue_exec_locked() only
++    * signals the application's syncs after queue->companion_sync, so the
++    * application's fence already implies the copy is complete, and the encode
++    * runs after that fence.
++    *
++    * ANV_VA_STAGE_COMPUTE=1 keeps the old "copy on a compute queue at encode
++    * time" path available for A/B testing. */
++   const bool in_batch = getenv("ANV_VA_STAGE_COMPUTE") == NULL;
++   if (in_batch) {
++      struct anv_cmd_buffer *comp = NULL;
++      if (getenv("ANV_VA_STAGE_NOSYNC") == NULL) {
++         /* The copy runs on the video queue's RCS companion *at this point of
++          * the application's command stream*: anv_begin_companion_cmd_buffer_helper()
++          * emits a semaphore handshake that stalls the video batch until the
++          * companion finished the copy.  That ordering matters - the
++          * application's layout transition and cache flushes for the image are
++          * in the video batch, and a copy that ran concurrently with them would
++          * sample a partially-incoherent atlas (random tiles from the previous
++          * frame). */
++         const struct anv_image *img = src;
++         anv_cmd_require_rcs(cmd_buffer, true) {
++            (void) img;
++            /* The atlas was written by the application's compute queue; the
++             * layout barrier that flushes/invalidates caches is emitted on the
++             * *video* engine, so this engine's own L1/L2 (texture, state,
++             * constant, VF) can still hold lines for this image from an
++             * earlier frame.  Invalidate them here, before BLORP samples the
++             * image - otherwise individual tiles can come out a frame old.
++             * BLORP applies the pending flushes at the start of its batch. */
++            anv_add_pending_pipe_bits(cmd_buffer,
++                                      VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
++                                      VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
++                                      ANV_PIPE_TEXTURE_CACHE_INVALIDATE_BIT |
++                                      ANV_PIPE_STATE_CACHE_INVALIDATE_BIT |
++                                      ANV_PIPE_CONSTANT_CACHE_INVALIDATE_BIT |
++                                      ANV_PIPE_INSTRUCTION_CACHE_INVALIDATE_BIT |
++                                      ANV_PIPE_VF_CACHE_INVALIDATE_BIT,
++                                      "staging: invalidate before sampling atlas");
++            anv_CmdCopyImageToMemoryKHR(anv_cmd_buffer_to_handle(cmd_buffer),
++                                        &info);
++            comp = cmd_buffer;
++         }
++      } else {
++         if (anv_cmd_buffer_ensure_rcs_companion(cmd_buffer) == VK_SUCCESS)
++            comp = cmd_buffer->companion_rcs_cmd_buffer;
++         if (comp)
++            anv_CmdCopyImageToMemoryKHR(anv_cmd_buffer_to_handle(comp), &info);
++      }
++      if (comp) {
++         job->linear_copied = true;
++      } else {
++         VLOG("no RCS companion for the in-batch copy");
++      }
++   }
++
++   VLOG("linear buffer %ux%u pitch=%u luma=%llu chroma=%llu addr=0x%llx planes=%u in_batch=%d "
++        "type=%u/0x%x flags=0x%x",
++        w, h, pitch, (unsigned long long)luma, (unsigned long long)chroma,
++        (unsigned long long)addr, nplanes, in_batch, ai.memoryTypeIndex,
++        (unsigned) mr.memoryRequirements.memoryTypeBits,
++        (unsigned) device->physical->memory.types[ai.memoryTypeIndex].propertyFlags);
++}
++
++void anv_va_log_query(VkQueryPool pool, uint32_t first, uint32_t count,
++                      size_t stride, const uint32_t *vals) {
++   VLOGV("FEEDBACK READ pool=%p first=%u count=%u stride=%zu off=%u size=%u status=%u",
++        (void*)pool, first, count, stride,
++        vals ? vals[0] : 0, vals ? vals[1] : 0, vals ? vals[2] : 0);
++}
++
++bool anv_va_feedback_get(VkQueryPool pool, uint32_t index,
++                         uint32_t *offset, uint32_t *size) {
++   pthread_mutex_lock(&g_fb_lock);
++   VaFeedback *e = fb_find(pool, index);
++   bool ready = e && e->ready;
++   if (ready) { *offset = e->off; *size = e->size; }
++   pthread_mutex_unlock(&g_fb_lock);
++   return ready;
++}
++
++static void backend_destroy(struct anv_va_session *s);
++/* Rate control requested by the application (VkVideoEncodeRateControlInfoKHR,
++ * delivered through vkCmdControlVideoCodingKHR).  Used instead of the old
++ * extent/fps heuristic so the bitstream matches what vrlink asks for. */
++static uint64_t g_rc_bitrate;
++static uint64_t g_rc_max_bitrate;
++static uint32_t g_rc_fps_num, g_rc_fps_den, g_rc_mode, g_rc_vbv_ms;
++
++/* Rate control belongs to the *stream*, not to one encoder context.
++ *
++ * With three slot sessions each one sees every third picture, so anything
++ * derived from "the frames this context has seen" (arrival rate, last applied
++ * target, first-target latch) is three times slower or simply different per
++ * session.  In particular the frame-rate parameter is the divisor iHD uses
++ * for its per-frame budget: a session told 30 fps with a target of B spends
++ * B/30 per picture and delivers B, so three of them would deliver 3B.  The
++ * stream is still 90 fps and each session still spends B/90 per picture, so
++ * all three are told the stream rate and the per-frame target is resolved
++ * once, here, and then applied to every slot session.
++ *
++ * Guarded by g_stream_lock: the application's rate-control note and the
++ * worker both enter the rate-control decision. */
++static struct {
++   int64_t  last_frame_ns;
++   double   fps_meas;
++   uint64_t bitrate;        /* last target handed to the encoders */
++   bool     from_app;       /* the application's rate control has been adopted */
++   uint64_t last_logged_rate;
++   int64_t  last_log_ns;
++} g_stream;
++/* g_stream is shared between the application's rate-control note and the
++ * worker.  The critical section is the rate-control decision and the
++ * per-slot stats; the encode itself stays outside it. */
++static pthread_mutex_t g_stream_lock = PTHREAD_MUTEX_INITIALIZER;
++/* Serialises session-set creation/reopen.  Encode calls on different
++ * sessions do not take it. */
++static pthread_mutex_t g_set_lock = PTHREAD_MUTEX_INITIALIZER;
++
++void anv_va_note_rate_control(uint32_t mode, uint32_t layer_count,
++                              const uint64_t *avg_bitrate,
++                              const uint64_t *max_bitrate,
++                              const uint32_t *fps_num, const uint32_t *fps_den,
++                              uint32_t vbv_ms)
++{
++   g_rc_mode = mode;
++   g_rc_vbv_ms = vbv_ms;
++   if (layer_count > 0 && avg_bitrate && avg_bitrate[0]) {
++      g_rc_bitrate = avg_bitrate[0];
++      g_rc_max_bitrate = max_bitrate ? max_bitrate[0] : 0;
++      g_rc_fps_num = fps_num ? fps_num[0] : 0;
++      g_rc_fps_den = fps_den ? fps_den[0] : 0;
++   }
++   /* The session-parameter backend no longer has to be dropped when the
++    * application announces a bitrate: the rate-control struct is built per
++    * frame, and the VPS/SPS/PPS do not depend on the rate. */
++
++   static int n;
++   if (n++ < 8)
++      VLOG("app rate control: mode=%u layers=%u bitrate=%llu fps=%u/%u vbv=%ums",
++           mode, layer_count, (unsigned long long)g_rc_bitrate,
++           g_rc_fps_num, g_rc_fps_den, vbv_ms);
++}
++
++/* ---- Parameter sets ----------------------------------------------------
++ *
++ * The shim hands the application the VPS/SPS/PPS it transmits out of band
++ * (vkGetEncodedVideoSessionParametersKHR) and strips those same parameter
++ * sets from every coded frame before copying it into the application's
++ * buffer.  Both copies must come from one source, or a client would decode
++ * our slices against a parameter set the encoder never used.  That source is
++ * this writer.
++ *
++ * Field values are the ones iHD accepted from hevc_vaapi for this stream:
++ * Main/Main10, CTU 64 with transform blocks 4..32, SAO, AMP and temporal MVP
++ * on, cu_qp_delta on with diff depth 3, log2_max_poc_lsb 12, a VUI with the
++ * frame rate only, and level chosen from the table below.
++ */
++struct va_bw {
++   uint8_t d[256];
++   uint32_t nbits;
++};
++
++static void va_bw_bits(struct va_bw *b, uint64_t v, int n)
++{
++   for (int i = n - 1; i >= 0; i--) {
++      if ((v >> i) & 1)
++         b->d[b->nbits >> 3] |= 0x80 >> (b->nbits & 7);
++      b->nbits++;
++   }
++}
++
++static void va_bw_ue(struct va_bw *b, uint32_t v)
++{
++   v++;
++   int n = 0;
++   while (v >> (n + 1))
++      n++;
++   va_bw_bits(b, 0, n);
++   va_bw_bits(b, v, n + 1);
++}
++
++static void va_bw_se(struct va_bw *b, int v)
++{
++   va_bw_ue(b, v > 0 ? (uint32_t)(2 * v - 1) : (uint32_t)(-2 * v));
++}
++
++static void va_bw_trailing(struct va_bw *b)
++{
++   va_bw_bits(b, 1, 1);
++   while (b->nbits & 7)
++      va_bw_bits(b, 0, 1);
++}
++
++static void va_bw_init(struct va_bw *b)
++{
++   memset(b, 0, sizeof(*b));
++}
++
++/* profile_tier_level(), written the way ffmpeg's cbs writer does it: for
++ * Main and Main10 it takes the profile_compatible(2) branch, i.e. 7 reserved
++ * bits, one_picture_only_constraint_flag, 35 reserved bits and inbld_flag. */
++static void va_bw_ptl(struct va_bw *b, uint32_t profile_idc, uint32_t level_idc)
++{
++   va_bw_bits(b, 0, 2);                 /* general_profile_space */
++   va_bw_bits(b, 0, 1);                 /* general_tier_flag */
++   va_bw_bits(b, profile_idc, 5);
++   for (int j = 0; j < 32; j++)
++      va_bw_bits(b, j == (int) profile_idc, 1);
++   va_bw_bits(b, 1, 1);                 /* general_progressive_source_flag */
++   va_bw_bits(b, 0, 1);                 /* general_interlaced_source_flag */
++   va_bw_bits(b, 1, 1);                 /* general_non_packed_constraint_flag */
++   va_bw_bits(b, 1, 1);                 /* general_frame_only_constraint_flag */
++   va_bw_bits(b, 0, 7);                 /* general_reserved_zero_7bits */
++   va_bw_bits(b, 0, 1);                 /* general_one_picture_only_constraint_flag */
++   va_bw_bits(b, 0, 35);                /* general_reserved_zero_35bits */
++   va_bw_bits(b, 0, 1);                 /* general_inbld_flag */
++   va_bw_bits(b, level_idc, 8);
++}
++
++static void va_bw_vps(struct va_bw *b, const struct anv_va_session *s)
++{
++   va_bw_bits(b, 0, 4);                 /* vps_video_parameter_set_id */
++   va_bw_bits(b, 1, 1);                 /* vps_base_layer_internal_flag */
++   va_bw_bits(b, 1, 1);                 /* vps_base_layer_available_flag */
++   va_bw_bits(b, 0, 6);                 /* vps_max_layers_minus1 */
++   va_bw_bits(b, 0, 3);                 /* vps_max_sub_layers_minus1 */
++   va_bw_bits(b, 1, 1);                 /* vps_temporal_id_nesting_flag */
++   va_bw_bits(b, 0xffff, 16);           /* vps_reserved_0xffff_16bits */
++   va_bw_ptl(b, s->profile_idc, s->level_idc);
++   va_bw_bits(b, 0, 1);                 /* vps_sub_layer_ordering_info_present_flag */
++   va_bw_ue(b, 1);                      /* vps_max_dec_pic_buffering_minus1 */
++   va_bw_ue(b, 0);                      /* vps_max_num_reorder_pics */
++   va_bw_ue(b, 0);                      /* vps_max_latency_increase_plus1 */
++   va_bw_bits(b, 0, 6);                 /* vps_max_layer_id */
++   va_bw_ue(b, 0);                      /* vps_num_layer_sets_minus1 */
++   va_bw_bits(b, 1, 1);                 /* vps_timing_info_present_flag */
++   va_bw_bits(b, 1, 32);                /* vps_num_units_in_tick */
++   va_bw_bits(b, s->fps, 32);           /* vps_time_scale */
++   va_bw_bits(b, 1, 1);                 /* vps_poc_proportional_to_timing_flag */
++   va_bw_ue(b, 0);                      /* vps_num_ticks_poc_diff_one_minus1 */
++   va_bw_ue(b, 0);                      /* vps_num_hrd_parameters */
++   va_bw_bits(b, 0, 1);                 /* vps_extension_flag */
++   va_bw_trailing(b);
++}
++
++static void va_bw_sps(struct va_bw *b, const struct anv_va_session *s)
++{
++   const uint32_t bd = s->ten_bit ? 10 : 8;
++   va_bw_bits(b, 0, 4);                 /* sps_video_parameter_set_id */
++   va_bw_bits(b, 0, 3);                 /* sps_max_sub_layers_minus1 */
++   va_bw_bits(b, 1, 1);                 /* sps_temporal_id_nesting_flag */
++   va_bw_ptl(b, s->profile_idc, s->level_idc);
++   va_bw_ue(b, 0);                      /* sps_seq_parameter_set_id */
++   va_bw_ue(b, 1);                      /* chroma_format_idc: 4:2:0 */
++   va_bw_ue(b, s->w);                   /* pic_width_in_luma_samples */
++   va_bw_ue(b, s->h);                   /* pic_height_in_luma_samples */
++   va_bw_bits(b, 0, 1);                 /* conformance_window_flag */
++   va_bw_ue(b, bd - 8);                 /* bit_depth_luma_minus8 */
++   va_bw_ue(b, bd - 8);                 /* bit_depth_chroma_minus8 */
++   va_bw_ue(b, 8);                      /* log2_max_pic_order_cnt_lsb_minus4 */
++   va_bw_bits(b, 0, 1);                 /* sps_sub_layer_ordering_info_present_flag */
++   va_bw_ue(b, 1);                      /* sps_max_dec_pic_buffering_minus1 */
++   va_bw_ue(b, 0);                      /* sps_max_num_reorder_pics */
++   va_bw_ue(b, 0);                      /* sps_max_latency_increase_plus1 */
++   va_bw_ue(b, 0);                      /* log2_min_luma_coding_block_size_minus3 */
++   va_bw_ue(b, 3);                      /* log2_diff_max_min_luma_coding_block_size */
++   va_bw_ue(b, 0);                      /* log2_min_luma_transform_block_size_minus2 */
++   va_bw_ue(b, 3);                      /* log2_diff_max_min_transform_block_size */
++   va_bw_ue(b, 2);                      /* max_transform_hierarchy_depth_inter */
++   va_bw_ue(b, 2);                      /* max_transform_hierarchy_depth_intra */
++   va_bw_bits(b, 0, 1);                 /* scaling_list_enabled_flag */
++   va_bw_bits(b, s->amp, 1);            /* amp_enabled_flag */
++   va_bw_bits(b, s->sao, 1);            /* sample_adaptive_offset_enabled_flag */
++   va_bw_bits(b, 0, 1);                 /* pcm_enabled_flag */
++   va_bw_ue(b, 0);                      /* num_short_term_ref_pic_sets */
++   va_bw_bits(b, 0, 1);                 /* long_term_ref_pics_present_flag */
++   va_bw_bits(b, s->temporal_mvp, 1);   /* sps_temporal_mvp_enabled_flag */
++   va_bw_bits(b, 0, 1);                 /* strong_intra_smoothing_enabled_flag */
++   va_bw_bits(b, 1, 1);                 /* vui_parameters_present_flag */
++   /* VUI: frame rate only.  video_signal_type and chroma_loc stay absent so
++    * the parameter set is identical to the one the stream shipped with. */
++   va_bw_bits(b, 0, 1);                 /* aspect_ratio_info_present_flag */
++   va_bw_bits(b, 0, 1);                 /* overscan_info_present_flag */
++   va_bw_bits(b, 0, 1);                 /* video_signal_type_present_flag */
++   va_bw_bits(b, 0, 1);                 /* chroma_loc_info_present_flag */
++   va_bw_bits(b, 0, 1);                 /* neutral_chroma_indication_flag */
++   va_bw_bits(b, 0, 1);                 /* field_seq_flag */
++   va_bw_bits(b, 0, 1);                 /* frame_field_info_present_flag */
++   va_bw_bits(b, 0, 1);                 /* default_display_window_flag */
++   va_bw_bits(b, 1, 1);                 /* vui_timing_info_present_flag */
++   va_bw_bits(b, 1, 32);                /* vui_num_units_in_tick */
++   va_bw_bits(b, s->fps, 32);           /* vui_time_scale */
++   va_bw_bits(b, 1, 1);                 /* vui_poc_proportional_to_timing_flag */
++   va_bw_ue(b, 0);                      /* vui_num_ticks_poc_diff_one_minus1 */
++   va_bw_bits(b, 0, 1);                 /* vui_hrd_parameters_present_flag */
++   va_bw_bits(b, 1, 1);                 /* bitstream_restriction_flag */
++   va_bw_bits(b, 0, 1);                 /* tiles_fixed_structure_flag */
++   va_bw_bits(b, 1, 1);                 /* motion_vectors_over_pic_boundaries_flag */
++   va_bw_bits(b, 1, 1);                 /* restricted_ref_pic_lists_flag */
++   va_bw_ue(b, 0);                      /* min_spatial_segmentation_idc */
++   va_bw_ue(b, 0);                      /* max_bytes_per_pic_denom */
++   va_bw_ue(b, 0);                      /* max_bits_per_min_cu_denom */
++   va_bw_ue(b, 15);                     /* log2_max_mv_length_horizontal */
++   va_bw_ue(b, 15);                     /* log2_max_mv_length_vertical */
++   va_bw_bits(b, 0, 1);                 /* sps_extension_present_flag */
++   va_bw_trailing(b);
++}
++
++static void va_bw_pps(struct va_bw *b, const struct anv_va_session *s,
++                      int init_qp_minus26)
++{
++   va_bw_ue(b, 0);                      /* pps_pic_parameter_set_id */
++   va_bw_ue(b, 0);                      /* pps_seq_parameter_set_id */
++   va_bw_bits(b, 0, 1);                 /* dependent_slice_segments_enabled_flag */
++   va_bw_bits(b, 0, 1);                 /* output_flag_present_flag */
++   va_bw_bits(b, 0, 3);                 /* num_extra_slice_header_bits */
++   va_bw_bits(b, 0, 1);                 /* sign_data_hiding_enabled_flag */
++   va_bw_bits(b, 0, 1);                 /* cabac_init_present_flag */
++   va_bw_ue(b, 0);                      /* num_ref_idx_l0_default_active_minus1 */
++   va_bw_ue(b, 0);                      /* num_ref_idx_l1_default_active_minus1 */
++   va_bw_se(b, init_qp_minus26);
++   va_bw_bits(b, 0, 1);                 /* constrained_intra_pred_flag */
++   va_bw_bits(b, 1, 1);                 /* transform_skip_enabled_flag */
++   va_bw_bits(b, s->rc_mode != VA_RC_CQP, 1); /* cu_qp_delta_enabled_flag */
++   if (s->rc_mode != VA_RC_CQP)
++      va_bw_ue(b, VA_HEVC_DIFF_CU_QP);  /* diff_cu_qp_delta_depth */
++   va_bw_se(b, 0);                      /* pps_cb_qp_offset */
++   va_bw_se(b, 0);                      /* pps_cr_qp_offset */
++   va_bw_bits(b, 0, 1);                 /* pps_slice_chroma_qp_offsets_present_flag */
++   va_bw_bits(b, 0, 1);                 /* weighted_pred_flag */
++   va_bw_bits(b, 0, 1);                 /* weighted_bipred_flag */
++   va_bw_bits(b, 0, 1);                 /* transquant_bypass_enabled_flag */
++   va_bw_bits(b, 0, 1);                 /* tiles_enabled_flag */
++   va_bw_bits(b, 0, 1);                 /* entropy_coding_sync_enabled_flag */
++   va_bw_bits(b, 1, 1);                 /* pps_loop_filter_across_slices_enabled_flag */
++   va_bw_bits(b, 0, 1);                 /* deblocking_filter_control_present_flag */
++   va_bw_bits(b, 0, 1);                 /* pps_scaling_list_data_present_flag */
++   va_bw_bits(b, 0, 1);                 /* lists_modification_present_flag */
++   va_bw_ue(b, 0);                      /* log2_parallel_merge_level_minus2 */
++   va_bw_bits(b, 0, 1);                 /* slice_segment_header_extension_present_flag */
++   va_bw_bits(b, 0, 1);                 /* pps_extension_present_flag */
++   va_bw_trailing(b);
++}
++
++/* Append one NAL unit (start code, two-byte header, RBSP with emulation
++ * prevention) to out.  Returns the number of bytes written, 0 on overflow. */
++static size_t va_nal(uint8_t *out, size_t cap, uint32_t type,
++                     const struct va_bw *b)
++{
++   const size_t nb = (b->nbits + 7) / 8;
++   if (cap < 6 + nb + nb / 2)
++      return 0;
++   size_t n = 0;
++   out[n++] = 0; out[n++] = 0; out[n++] = 0; out[n++] = 1;
++   out[n++] = (uint8_t)((type << 1) & 0x7f);
++   out[n++] = 1;
++   unsigned zeros = 0;
++   for (size_t i = 0; i < nb; i++) {
++      const uint8_t x = b->d[i];
++      if (zeros >= 2 && x <= 3) {
++         out[n++] = 3;
++         zeros = 0;
++      }
++      out[n++] = x;
++      zeros = x == 0 ? zeros + 1 : 0;
++   }
++   return n;
++}
++
++/* Level from H.265 Table A.8/A.9, the way ffmpeg's ff_h265_guess_level()
++ * reads it (cpb_nal_factor 1100 for Main/Main10, main tier). */
++/* H.265 CpbBrNalFactor by general_profile_idc: 1000 for Main/Main10/
++ * MainStillPicture, 1100 for Main 4:2:2 10/12, 1200 for the 4:4:4 profiles. */
++static uint32_t va_cpb_nal_factor(uint32_t profile_idc)
++{
++   switch (profile_idc) {
++   case 4: case 5:                    /* Main 4:2:2 10 / 12 */
++      return 1100;
++   case 6: case 7: case 8: case 9:    /* Main 4:4:4 family */
++      return 1200;
++   default:                           /* Main, Main10, MainStillPicture */
++      return 1000;
++   }
++}
++
++static uint32_t va_level_idc(uint32_t w, uint32_t h, uint64_t bitrate,
++                             uint32_t profile_idc)
++{
++   /* max_br is in kbit/s, as in H.265 Table A.9; the bit-rate test is
++    * bitrate > CpbBrNalFactor * max_br. */
++   static const struct { uint8_t idc; uint32_t max_luma_ps, max_br; } t[] = {
++      {  30,    36864,    128 }, {  60,   122880,   1500 },
++      {  63,   245760,   3000 }, {  90,   552960,   6000 },
++      {  93,   983040,  10000 }, { 120,  2228224,  12000 },
++      { 123,  2228224,  20000 }, { 150,  8912896,  25000 },
++      { 153,  8912896,  40000 }, { 156,  8912896,  60000 },
++      { 180, 35651584,  60000 }, { 183, 35651584, 120000 },
++      { 186, 35651584, 240000 },
++   };
++   const uint64_t pic = (uint64_t) w * h;
++   for (unsigned i = 0; i < ARRAY_SIZE(t); i++) {
++      if (pic > t[i].max_luma_ps)
++         continue;
++      if ((uint64_t) w * w > 8ull * t[i].max_luma_ps)
++         continue;
++      if ((uint64_t) h * h > 8ull * t[i].max_luma_ps)
++         continue;
++      if (bitrate > (uint64_t) va_cpb_nal_factor(profile_idc) * t[i].max_br)
++         continue;
++      return t[i].idc;
++   }
++   /* Above the highest real HEVC level (6.2, 240 Mbit/s at the 1000
++    * CpbBrNalFactor): clamp to 6.2 rather than emitting the 255 "8.5"
++    * placeholder, which is not a level the iHD/decoder can actually use. */
++   return 186;                          /* level 6.2 */
++}
++
++static bool va_build_headers(struct anv_va_session *s)
++{
++   struct va_bw b;
++   uint8_t buf[512];
++   size_t n = 0, w;
++
++   va_bw_init(&b); va_bw_vps(&b, s);
++   w = va_nal(buf + n, sizeof(buf) - n, 32, &b); if (!w) return false; n += w;
++   va_bw_init(&b); va_bw_sps(&b, s);
++   w = va_nal(buf + n, sizeof(buf) - n, 33, &b); if (!w) return false; n += w;
++   va_bw_init(&b);
++   va_bw_pps(&b, s, (int) (s->rc_mode == VA_RC_CQP ? s->fixed_qp : VA_HEVC_INIT_QP) - 26);
++   w = va_nal(buf + n, sizeof(buf) - n, 34, &b); if (!w) return false; n += w;
++
++   free(s->headers);
++   s->headers = malloc(n);
++   if (!s->headers)
++      return false;
++   memcpy(s->headers, buf, n);
++   s->headers_size = n;
++   return true;
++}
++
++/* slice_segment_header() up to the CABAC payload, for the packed-slice-header
++ * path.  iHD writes these verbatim, so the
++ * bitstream keeps exactly the slice headers the stream shipped with; without
++ * them iHD lets the hardware pack the headers instead
++ * (bAcceleratorHeaderPackingCaps), which is a different code path.
++ *
++ * Syntax, for our PPS (no dependent slices, no extra slice-header bits,
++ * SAO on, loop filter across slices on):
++ *   first_slice_segment_in_pic_flag
++ *   no_output_of_prior_pics_flag            (IRAP only)
++ *   slice_pic_parameter_set_id ue
++ *   [slice_segment_address u(v)]            (not the first slice)
++ *   slice_type ue
++ *   slice_sao_luma_flag, slice_sao_chroma_flag
++ *   slice_qp_delta se
++ *   slice_loop_filter_across_slices_enabled_flag
++ *   byte_alignment()
++ */
++static size_t va_slice_header(uint8_t *out, size_t cap,
++                              const struct anv_va_session *s, uint32_t addr,
++                              bool first, uint32_t addr_bits, int32_t qp_delta)
++{
++   struct va_bw b;
++   va_bw_init(&b);
++   va_bw_bits(&b, first, 1);
++   va_bw_bits(&b, 0, 1);                 /* no_output_of_prior_pics_flag */
++   va_bw_ue(&b, 0);                      /* slice_pic_parameter_set_id */
++   if (!first)
++      va_bw_bits(&b, addr, addr_bits);   /* slice_segment_address */
++   va_bw_ue(&b, VA_HEVC_SLICE_I);        /* slice_type */
++   if (s->sao) {
++      va_bw_bits(&b, 1, 1);              /* slice_sao_luma_flag */
++      va_bw_bits(&b, 1, 1);              /* slice_sao_chroma_flag */
++   }
++   va_bw_se(&b, qp_delta);               /* slice_qp_delta */
++   if (s->sao)
++      va_bw_bits(&b, 0, 1);              /* slice_loop_filter_across_slices */
++   va_bw_bits(&b, 1, 1);                 /* byte_alignment() */
++   while (b.nbits & 7)
++      va_bw_bits(&b, 0, 1);
++   return va_nal(out, cap, VA_HEVC_NAL_IDR_W_RADL, &b);
++}
++
++/* ---- dma-buf import ----------------------------------------------------
++ *
++ * The application's P010/NV12 image is exported as a dma-buf and imported as
++ * a VA surface, or - with staging enabled - the linear blit of it is.  The
++ * descriptor is filled the same way a DRM frame descriptor is: one object
++ * holding both planes when possible, two
++ * layers (R16 + RG1616 for 10 bit, R8 + GR88 for 8 bit) and the image's own
++ * ISL modifier, which is what tells iHD how the BO is tiled.
++ */
++struct va_drm_object {
++   int fd;
++   uint32_t size;
++   uint64_t modifier;
++};
++
++struct va_drm_layer {
++   uint32_t drm_format;
++   uint32_t num_planes;
++   uint32_t object_index[2];
++   uint32_t offset[2];
++   uint32_t pitch[2];
++};
++
++struct va_drm_frame {
++   uint32_t num_objects;
++   struct va_drm_object obj[2];
++   uint32_t num_layers;
++   struct va_drm_layer layer[2];
++};
++
++/* Does the exported dma-buf carry the render fence?  If it does, and iHD
++ * honours implicit fencing, the encoder's hardware can wait for the frame
++ * itself and our worker need not block on it - the cheapest of the latency
++ * fixes.  If it does not, the CPU wait is unavoidable without a second
++ * context.  Probe rather than assume. */
++static void va_probe_dma_fence(int fd, const char *what)
++{
++   struct dma_buf_export_sync_file esf = { .flags = DMA_BUF_SYNC_RW, .fd = -1 };
++   static int n;
++   if (ioctl(fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &esf) == 0 && esf.fd >= 0) {
++      struct pollfd p = { .fd = esf.fd, .events = POLLIN, .revents = 0 };
++      const int r = poll(&p, 1, 0);
++      if (n++ < 20)
++         VLOG("dma-buf %s: implicit fence present and %s", what,
++              r > 0 ? "already signalled" : "PENDING (a wait iHD could do)");
++      close(esf.fd);
++   } else {
++      if (n++ < 20)
++         VLOG("dma-buf %s: no implicit fence (%s)", what, strerror(errno));
++   }
++}
++
++static VASurfaceID va_import_surface(struct anv_va_session *s,
++                                     const struct va_drm_frame *f)
++{
++   VADRMPRIMESurfaceDescriptor desc;
++   VASurfaceAttrib attrs[2];
++   VASurfaceID surf = VA_INVALID_SURFACE;
++   VAStatus st;
++
++   memset(&desc, 0, sizeof(desc));
++   desc.fourcc = s->fourcc;
++   desc.width = s->w;
++   desc.height = s->h;
++   desc.num_objects = f->num_objects;
++   for (uint32_t i = 0; i < f->num_objects; i++) {
++      desc.objects[i].fd = f->obj[i].fd;
++      desc.objects[i].size = f->obj[i].size;
++      desc.objects[i].drm_format_modifier = f->obj[i].modifier;
++   }
++   desc.num_layers = f->num_layers;
++   for (uint32_t i = 0; i < f->num_layers; i++) {
++      desc.layers[i].drm_format = f->layer[i].drm_format;
++      desc.layers[i].num_planes = f->layer[i].num_planes;
++      for (uint32_t j = 0; j < f->layer[i].num_planes; j++) {
++         desc.layers[i].object_index[j] = f->layer[i].object_index[j];
++         desc.layers[i].offset[j] = f->layer[i].offset[j];
++         desc.layers[i].pitch[j] = f->layer[i].pitch[j];
++      }
++   }
++
++   memset(attrs, 0, sizeof(attrs));
++   attrs[0].type = VASurfaceAttribMemoryType;
++   attrs[0].flags = VA_SURFACE_ATTRIB_SETTABLE;
++   attrs[0].value.type = VAGenericValueTypeInteger;
++   attrs[0].value.value.i = VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2;
++   attrs[1].type = VASurfaceAttribExternalBufferDescriptor;
++   attrs[1].flags = VA_SURFACE_ATTRIB_SETTABLE;
++   attrs[1].value.type = VAGenericValueTypePointer;
++   attrs[1].value.value.p = &desc;
++
++   st = vaCreateSurfaces(s->dpy, s->rt_format, s->w, s->h, &surf, 1, attrs, 2);
++   if (st != VA_STATUS_SUCCESS) {
++      static int n;
++      if (n++ < 20)
++         VLOG("vaCreateSurfaces(import) failed: %d (%s) mod=0x%llx pitch=%u",
++              st, vaErrorStr(st), (unsigned long long) f->obj[0].modifier,
++              f->layer[0].pitch[0]);
++      return VA_INVALID_SURFACE;
++   }
++   return surf;
++}
++
++static void backend_destroy(struct anv_va_session *s)
++{
++   if (!s)
++      return;
++   if (s->frames)
++      VLOG("encoder closed: %llu frame(s) encoded on this context",
++           (unsigned long long) s->frames);
++   if (s->dpy) {
++      for (unsigned i = 0; i < VA_CODED_BUFFERS; i++)
++         if (s->coded[i] != VA_INVALID_ID)
++            vaDestroyBuffer(s->dpy, s->coded[i]);
++      for (unsigned i = 0; i < VA_RECON_SURFACES; i++)
++         if (s->recon[i] != VA_INVALID_SURFACE)
++            vaDestroySurfaces(s->dpy, &s->recon[i], 1);
++      if (s->ctx != VA_INVALID_ID)
++         vaDestroyContext(s->dpy, s->ctx);
++      if (s->cfg != VA_INVALID_ID)
++         vaDestroyConfig(s->dpy, s->cfg);
++      /* The display is shared by the set's slot contexts; only the session
++       * that created it (the header-only pending one) terminates it. */
++      if (s->owns_dpy)
++         vaTerminate(s->dpy);
++   }
++   free(s->headers);
++   if (s->owns_dpy && s->drm_fd >= 0)
++      close(s->drm_fd);
++   free(s);
++}
++
++static struct anv_va_session *backend_create(VkFormat fmt, uint32_t w, uint32_t h,
++                                             uint32_t fps,
++                                             struct anv_device *device,
++                                             struct va_sessions *set,
++                                             const struct anv_va_session *templ)
++{
++   const int64_t t_create = os_time_get_nano();
++   struct anv_va_session *s = calloc(1, sizeof(*s));
++   if (!s)
++      return NULL;
++   s->fmt = fmt; s->w = w; s->h = h;
++   s->drm_fd = -1;
++   s->cfg = s->ctx = VA_INVALID_ID;
++   for (unsigned i = 0; i < VA_RECON_SURFACES; i++)
++      s->recon[i] = VA_INVALID_SURFACE;
++   for (unsigned i = 0; i < VA_CODED_BUFFERS; i++)
++      s->coded[i] = VA_INVALID_ID;
++
++   if (fmt == VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16) {
++      s->ten_bit = true;
++      s->profile_idc = 2;
++      s->va_profile = VAProfileHEVCMain10;
++      s->rt_format = VA_RT_FORMAT_YUV420_10;
++      s->fourcc = VA_FOURCC_P010;
++   } else if (fmt == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM) {
++      s->ten_bit = false;
++      s->profile_idc = 1;
++      s->va_profile = VAProfileHEVCMain;
++      s->rt_format = VA_RT_FORMAT_YUV420;
++      s->fourcc = VA_FOURCC_NV12;
++   } else {
++      VLOG("unsupported format %d", fmt);
++      free(s);
++      return NULL;
++   }
++
++   /* The application asks for 63.9 fps in its rate-control info but submits
++    * at ~90 fps; budget CBR at the rate the frames actually arrive at. */
++   fps = va_env_u32("ANV_VA_FPS", 0);
++   if (!fps || fps > 240)
++      fps = 90;
++   struct va_enc_opts opts = va_enc_opts_read();
++
++   uint64_t bitrate = (uint64_t) w * h * fps * 65 / 100;
++   const char *bitrate_src = "heuristic";
++   const char *br_env = getenv("ANV_VA_BITRATE");
++   if (br_env && atoll(br_env) >= 1000000) {
++      bitrate = (uint64_t) atoll(br_env);
++      bitrate_src = "ANV_VA_BITRATE";
++   } else if (g_rc_bitrate >= 1000000) {
++      const uint64_t floor = opts.bpp_floor > 0 ?
++         (uint64_t) ((double) w * h * fps * opts.bpp_floor) : 0;
++      if (floor && g_rc_bitrate < floor) {
++         bitrate = floor;
++         bitrate_src = "bits-per-pixel floor";
++      } else {
++         bitrate = g_rc_bitrate;
++         bitrate_src = "application rate control";
++      }
++   }
++   if (g_rc_fps_num && g_rc_fps_den) {
++      uint32_t rc_fps = (g_rc_fps_num + g_rc_fps_den / 2) / g_rc_fps_den;
++      /* Trust any plausible rate-control fps from the application.  The old
++       * 90%-of-90 gate silently ignored a configured 72 fps stream. */
++      if (rc_fps >= 1 && rc_fps <= 240)
++         fps = rc_fps;
++   }
++   if (bitrate < 1000000)
++      bitrate = 1000000;
++   if (opts.bitrate_cap > bitrate) {
++      bitrate = opts.bitrate_cap;
++      bitrate_src = "ANV_VA_BITRATE";
++   }
++   /* Additional slot sessions clone the first one, so the three parameter
++    * sets are identical by construction.  Everything that feeds the
++    * VPS/SPS/PPS or the per-frame sequence buffer (fps, level, config mode)
++    * is taken from the template rather than from the moment of creation:
++    * the application's bitrate ramps during the first frames and
++    * va_level_idc() uses it, so a session built a frame later could
++    * otherwise emit a different level in the SPS. */
++   if (templ) {
++      bitrate = templ->bitrate;
++      bitrate_src = "slot template";
++      fps = templ->fps;
++      opts = templ->opts;
++   }
++   s->bitrate = bitrate;
++   s->fps = fps;
++   s->level_idc = templ ? templ->level_idc :
++                  va_level_idc(w, h, bitrate, s->profile_idc);
++   s->opts = opts;
++   s->rc_mode = templ ? templ->rc_mode : (opts.cqp ? VA_RC_CQP : VA_RC_CBR);
++   s->fixed_qp = templ ? templ->fixed_qp : (opts.qp ? opts.qp : 24);
++   s->max_frame_size = templ ? templ->max_frame_size : opts.max_frame_size;
++   /* These three are what iHD advertised with the configuration the stream
++    * was validated against; queried below and only overridden if the driver
++    * says it cannot do them. */
++   s->sao = true; s->amp = true; s->temporal_mvp = true;
++   s->packed_headers = true;
++
++   int major = 0, minor = 0;
++   VAStatus st;
++   if (set && set->dpy) {
++      /* Every slot context lives on the same display.  Three separate
++       * vaInitialize() calls in one process are not equivalent: iHD then has
++       * three driver instances sharing one GPU, and the third context's
++       * first encode hung the VCS engine (xe: "Engine memory CAT error",
++       * "Timedout job ... in vkrepro").  One display, three contexts is the
++       * libva model and keeps a single buffer cache for the shared source
++       * dma-buf. */
++      s->dpy = set->dpy;
++      s->drm_fd = -1;
++      s->owns_dpy = false;
++   } else {
++      int fd = -1;
++      if (device && device->fd >= 0)
++         fd = dup(device->fd);
++      if (fd < 0)
++         fd = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
++      if (fd < 0) {
++         VLOG("cannot open a DRM device for VA-API: %s", strerror(errno));
++         free(s);
++         return NULL;
++      }
++      s->dpy = vaGetDisplayDRM(fd);
++      if (!s->dpy) {
++         VLOG("vaGetDisplayDRM failed");
++         close(fd);
++         free(s);
++         return NULL;
++      }
++      st = vaInitialize(s->dpy, &major, &minor);
++      if (st != VA_STATUS_SUCCESS) {
++         VLOG("vaInitialize failed: %d (%s)", st, vaErrorStr(st));
++         close(fd);
++         free(s);
++         return NULL;
++      }
++      if (set) {
++         /* The set owns the display from now on; the session must not
++          * terminate it in backend_destroy(). */
++         set->dpy = s->dpy;
++         set->drm_fd = fd;
++         s->drm_fd = -1;
++         s->owns_dpy = false;
++      } else {
++         s->drm_fd = fd;
++         s->owns_dpy = true;
++      }
++   }
++
++   VAEntrypoint eps[8];
++   int n_ep = 0;
++   st = vaQueryConfigEntrypoints(s->dpy, s->va_profile, eps, &n_ep);
++   bool have_slice = false;
++   for (int i = 0; st == VA_STATUS_SUCCESS && i < n_ep; i++)
++      if (eps[i] == VAEntrypointEncSlice)
++         have_slice = true;
++   if (st != VA_STATUS_SUCCESS || !have_slice) {
++      VLOG("no VAEntrypointEncSlice for profile %d (st=%d, %d entrypoints)",
++           s->va_profile, st, n_ep);
++      backend_destroy(s);
++      return NULL;
++   }
++
++   /* What the driver says it can do.  Logged because the parameter buffers
++    * below depend on it, and because "the driver advertised X" is the first
++    * question for any future driver-side difference. */
++   VAConfigAttrib q[6];
++   uint32_t n_q = 0;
++   q[n_q++].type = VAConfigAttribRateControl;
++   q[n_q++].type = VAConfigAttribEncSliceStructure;
++   q[n_q++].type = VAConfigAttribEncPackedHeaders;
++   q[n_q++].type = VAConfigAttribEncHEVCFeatures;
++   q[n_q++].type = VAConfigAttribEncHEVCBlockSizes;
++   q[n_q++].type = VAConfigAttribMaxFrameSize;
++   for (uint32_t i = 0; i < n_q; i++)
++      q[i].value = 0;
++   st = vaGetConfigAttributes(s->dpy, s->va_profile, VAEntrypointEncSlice, q, n_q);
++   if (st != VA_STATUS_SUCCESS) {
++      VLOG("vaGetConfigAttributes failed: %d (%s)", st, vaErrorStr(st));
++      backend_destroy(s);
++      return NULL;
++   }
++   const uint32_t rc_supported = q[0].value;
++   const uint32_t slice_struct = q[1].value;
++   const uint32_t packed = q[2].value;
++   const uint32_t hevc_features = q[3].value;
++   const uint32_t hevc_blocks = q[4].value;
++   const uint32_t maxframe_attr = q[5].value;
++
++   if (!(rc_supported & s->rc_mode) &&
++       rc_supported != VA_ATTRIB_NOT_SUPPORTED) {
++      VLOG("driver does not support the selected rate-control mode 0x%x "
++           "(supports 0x%x); falling back", s->rc_mode, rc_supported);
++      s->rc_mode = (rc_supported & VA_RC_CBR) ? VA_RC_CBR :
++                   (rc_supported & VA_RC_VBR) ? VA_RC_VBR : VA_RC_CQP;
++   }
++   if (packed != VA_ATTRIB_NOT_SUPPORTED &&
++       !(packed & VA_ENC_PACKED_HEADER_SEQUENCE)) {
++      VLOG("driver does not take packed sequence headers; iHD will generate "
++           "the VPS/SPS/PPS itself");
++      s->packed_headers = false;
++   }
++   if (hevc_features != VA_ATTRIB_NOT_SUPPORTED) {
++      VAConfigAttribValEncHEVCFeatures f = { .value = hevc_features };
++      s->sao = f.bits.sao != 0;
++      s->amp = f.bits.amp != 0;
++      s->temporal_mvp = f.bits.temporal_mvp != 0;
++   }
++   if (hevc_blocks != VA_ATTRIB_NOT_SUPPORTED) {
++      VAConfigAttribValEncHEVCBlockSizes b = { .value = hevc_blocks };
++      const uint32_t ctu = 1u << (b.bits.log2_max_coding_tree_block_size_minus3 + 3);
++      if (ctu != 64)
++         VLOG("driver CTU size is %u, not 64: the slice addresses and the SPS "
++              "are built for 64", ctu);
++   }
++   if (s->max_frame_size && maxframe_attr != VA_ATTRIB_NOT_SUPPORTED) {
++      /* The misc parameter exists and the driver takes it, but it is only
++       * wired for future use: submitting it changes the PAK into a
++       * multi-pass encode, which is not part of the validated stream. */
++      VLOG("max_frame_size %u not submitted (the validated stream does not "
++           "use it)", s->max_frame_size);
++      s->max_frame_size = 0;
++   }
++   if (opts.tile_cols || opts.tile_rows)
++      VLOG("ANV_VA_TILES=%ux%u ignored: the direct libva path encodes one "
++           "picture per frame with row slices and no tiles",
++           opts.tile_cols, opts.tile_rows);
++   if (opts.aud)
++      VLOG("ANV_VA_AUD ignored: access unit delimiters are not emitted");
++   if (s->max_frame_size && maxframe_attr == VA_ATTRIB_NOT_SUPPORTED) {
++      VLOG("max_frame_size %u ignored: the driver does not take "
++           "VAEncMiscParameterTypeMaxFrameSize", s->max_frame_size);
++      s->max_frame_size = 0;
++   }
++
++   /* RTFormat is not optional: it is what tells iHD which surface format the
++    * context encodes, and a config without it produces a context whose
++    * encodes fail with VA_STATUS_ERROR_ENCODING_ERROR at the first
++    * vaMapBuffer().  Packed headers are declared because the VPS/SPS/PPS and
++    * the slice headers are supplied by the shim. */
++   VAConfigAttrib cfg_attr[3];
++   uint32_t n_cfg = 0;
++   cfg_attr[n_cfg].type = VAConfigAttribRTFormat;
++   cfg_attr[n_cfg++].value = s->rt_format;
++   cfg_attr[n_cfg].type = VAConfigAttribRateControl;
++   cfg_attr[n_cfg++].value = s->rc_mode;
++   cfg_attr[n_cfg].type = VAConfigAttribEncPackedHeaders;
++   cfg_attr[n_cfg++].value = VA_ENC_PACKED_HEADER_SEQUENCE |
++                             VA_ENC_PACKED_HEADER_SLICE;
++   st = vaCreateConfig(s->dpy, s->va_profile, VAEntrypointEncSlice,
++                       cfg_attr, n_cfg, &s->cfg);
++   if (st != VA_STATUS_SUCCESS) {
++      VLOG("vaCreateConfig failed: %d (%s)", st, vaErrorStr(st));
++      backend_destroy(s);
++      return NULL;
++   }
++   st = vaCreateContext(s->dpy, s->cfg, w, h, VA_PROGRESSIVE, NULL, 0, &s->ctx);
++   if (st != VA_STATUS_SUCCESS) {
++      VLOG("vaCreateContext failed: %d (%s)", st, vaErrorStr(st));
++      backend_destroy(s);
++      return NULL;
++   }
++   st = vaCreateSurfaces(s->dpy, s->rt_format, w, h, s->recon,
++                         VA_RECON_SURFACES, NULL, 0);
++   if (st != VA_STATUS_SUCCESS) {
++      VLOG("vaCreateSurfaces(recon) failed: %d (%s)", st, vaErrorStr(st));
++      backend_destroy(s);
++      return NULL;
++   }
++   /* Room for the largest possible frame: the uncompressed picture plus
++    * headers, which is what iHD uses for the same stream. */
++   s->coded_size = (size_t) 3 * w * h + (1 << 16);
++   for (unsigned i = 0; i < VA_CODED_BUFFERS; i++) {
++      st = vaCreateBuffer(s->dpy, s->ctx, VAEncCodedBufferType,
++                          s->coded_size, 1, NULL, &s->coded[i]);
++      if (st != VA_STATUS_SUCCESS) {
++         VLOG("vaCreateBuffer(coded) failed: %d (%s)", st, vaErrorStr(st));
++         backend_destroy(s);
++         return NULL;
++      }
++   }
++   if (!va_build_headers(s)) {
++      VLOG("parameter-set writer overflowed");
++      backend_destroy(s);
++      return NULL;
++   }
++   /* One parameter-set source for all three slots: the application receives
++    * the VPS/SPS/PPS out of band from one session and the client decodes all
++    * three streams against that copy.  Cloning the template's bytes (rather
++    * than trusting that the same inputs produced the same bits) makes that a
++    * property of the code, and the comparison catches any input that still
++    * differs. */
++   if (templ && templ->headers && templ->headers_size) {
++      if (s->headers_size != templ->headers_size ||
++          memcmp(s->headers, templ->headers, s->headers_size) != 0) {
++         VLOG("slot %u parameter sets differ from slot %u (%zu vs %zu B); "
++              "using the template's copy", s->slot, templ->slot,
++              s->headers_size, templ->headers_size);
++         free(s->headers);
++         s->headers = malloc(templ->headers_size);
++         if (!s->headers) {
++            s->headers_size = 0;
++            backend_destroy(s);
++            return NULL;
++         }
++         memcpy(s->headers, templ->headers, templ->headers_size);
++         s->headers_size = templ->headers_size;
++      }
++   }
++   s->ready = true;
++
++   VLOG("backend ready %ux%u fmt=%d fps=%u bitrate=%llu (%s) level=%.1f "
++        "rc=%s qp=%u headers=%zu took=%.1fms | libva %d.%d vpp=%d.%d "
++        "rc_modes=0x%x slice_struct=0x%x packed=0x%x hevc_feat=0x%x "
++        "hevc_blocks=0x%x maxframe_attr=0x%x",
++        w, h, fmt, fps, (unsigned long long) bitrate, bitrate_src,
++        s->level_idc / 30.0,
++        s->rc_mode == VA_RC_CQP ? "CQP" : "CBR", s->fixed_qp, s->headers_size,
++        (os_time_get_nano() - t_create) / 1e6,
++        VA_MAJOR_VERSION, VA_MINOR_VERSION, major, minor,
++        rc_supported, slice_struct, packed, hevc_features, hevc_blocks,
++        maxframe_attr);
++   VLOG("va config: %s, %u recon surfaces, %u coded buffers of %zu B",
++        s->packed_headers ? "packed VPS/SPS/PPS" : "driver-generated PS",
++        VA_RECON_SURFACES, VA_CODED_BUFFERS, s->coded_size);
++   return s;
++}
++
++/* ---- per-frame submission ---------------------------------------------
++ *
++ * Buffer order is the one iHD accepts:
++ *   sequence, rate control, HRD, frame rate, picture,
++ *   packed header parameter, packed header data, slice x N
++ * The parameter buffers are created and destroyed per frame, so no state
++ * can leak from one frame to the next; only the recon
++ * surfaces and the coded buffers are pooled.
++ */
++struct va_frame_params {
++   uint32_t n_slices;
++   uint32_t slice_addr[VA_MAX_SLICES];
++   uint64_t bitrate;
++   uint32_t vbv_ms;
++   uint32_t min_qp, max_qp;
++   /* Stream frame rate (all three slot sessions use the same one; see
++    * g_stream).  This is the divisor of the per-frame budget. */
++   uint32_t rc_fps;
++};
++
++#define VA_CREATE(type_, ptr_, size_) do {                                    \
++      VABufferID id_ = VA_INVALID_ID;                                         \
++      st = vaCreateBuffer(s->dpy, s->ctx, (type_), (size_), 1, (ptr_), &id_); \
++      if (st != VA_STATUS_SUCCESS) {                                          \
++         VLOG("vaCreateBuffer(%d, %zu) failed: %d (%s)", (int) (type_),       \
++              (size_t) (size_), st, vaErrorStr(st));                          \
++         goto fail;                                                           \
++      }                                                                       \
++      bufs[nbuf++] = id_;                                                     \
++      tmp[ntmp++] = id_;                                                      \
++   } while (0)
++
++static VABufferID va_encode_frame(struct anv_va_session *s, VASurfaceID src,
++                                  const struct va_frame_params *p,
++                                  VASurfaceID *recon_out)
++{
++   VABufferID bufs[8 + VA_MAX_SLICES], tmp[8 + VA_MAX_SLICES];
++   uint32_t nbuf = 0, ntmp = 0;
++   VAStatus st;
++
++   const uint32_t n_ctu_cols = (s->w + 63) / 64;
++   const uint32_t n_ctu_rows = (s->h + 63) / 64;
++   const uint32_t n_ctus = n_ctu_cols * n_ctu_rows;
++   const uint32_t init_qp = s->rc_mode == VA_RC_CQP ? s->fixed_qp : VA_HEVC_INIT_QP;
++
++   /* The HEVC level is a function of the *current* bitrate.  The session is
++    * created from a slot template whose level was chosen at the startup
++    * bitrate, so a target that ramps to hundreds of Mbit/s would otherwise
++    * stay clamped to the template's level (e.g. 5.0 = 25 Mbit/s nominal)
++    * and VBR could never deliver the requested rate. */
++   if (p->bitrate) {
++      const uint32_t level = va_level_idc(s->w, s->h, p->bitrate,
++                                          s->profile_idc);
++      if (level != s->level_idc) {
++         VLOG("level change: %.1f -> %.1f at %llu bit/s",
++              s->level_idc / 30.0, level / 30.0,
++              (unsigned long long) p->bitrate);
++         s->level_idc = level;
++         if (!va_build_headers(s))
++            VLOG("level change: parameter-set rebuild failed");
++      }
++   }
++
++   /* 1. sequence parameters (one IDR per frame, so they go out every frame) */
++   VAEncSequenceParameterBufferHEVC seq;
++   memset(&seq, 0, sizeof(seq));
++   seq.general_profile_idc = s->profile_idc;
++   seq.general_level_idc = s->level_idc;
++   seq.general_tier_flag = 0;
++   seq.intra_period = 1;
++   seq.intra_idr_period = 1;
++   seq.ip_period = 1;
++   seq.bits_per_second = (uint32_t) p->bitrate;
++   seq.pic_width_in_luma_samples = s->w;
++   seq.pic_height_in_luma_samples = s->h;
++   seq.seq_fields.bits.chroma_format_idc = 1;
++   seq.seq_fields.bits.bit_depth_luma_minus8 = s->ten_bit ? 2 : 0;
++   seq.seq_fields.bits.bit_depth_chroma_minus8 = s->ten_bit ? 2 : 0;
++   seq.seq_fields.bits.amp_enabled_flag = s->amp;
++   seq.seq_fields.bits.sample_adaptive_offset_enabled_flag = s->sao;
++   seq.seq_fields.bits.sps_temporal_mvp_enabled_flag = s->temporal_mvp;
++   seq.log2_min_luma_coding_block_size_minus3 = 0;
++   seq.log2_diff_max_min_luma_coding_block_size = 3;
++   seq.log2_min_transform_block_size_minus2 = 0;
++   seq.log2_diff_max_min_transform_block_size = 3;
++   seq.max_transform_hierarchy_depth_inter = 2;
++   seq.max_transform_hierarchy_depth_intra = 2;
++   seq.vui_parameters_present_flag = 0;
++   VA_CREATE(VAEncSequenceParameterBufferType, &seq, sizeof(seq));
++
++   if (s->rc_mode != VA_RC_CQP) {
++      /* 2. rate control - rebuilt for every frame from the application's
++       * current target.  Caching this at encoder-open time is exactly why
++       * the delivered rate used to lag the request. */
++      uint8_t mpar[sizeof(VAEncMiscParameterBuffer) +
++                   sizeof(VAEncMiscParameterRateControl)];
++      VAEncMiscParameterBuffer *misc = (VAEncMiscParameterBuffer *) mpar;
++      VAEncMiscParameterRateControl rc;
++      memset(&rc, 0, sizeof(rc));
++      rc.bits_per_second = (uint32_t) p->bitrate;
++      rc.target_percentage = 100;
++      rc.window_size = p->vbv_ms;
++      rc.min_qp = p->min_qp;
++      rc.max_qp = p->max_qp;
++      rc.ICQ_quality_factor = 1;                 /* as iHD expects */
++      rc.rc_flags.bits.mb_rate_control = 2;      /* per-MB RC off */
++      misc->type = VAEncMiscParameterTypeRateControl;
++      memcpy(misc->data, &rc, sizeof(rc));
++      VA_CREATE(VAEncMiscParameterBufferType, mpar, sizeof(mpar));
++
++      /* 3. HRD (the VBV the decoder is modelled with, in bits) */
++      uint64_t vbv_bits = p->bitrate * p->vbv_ms / 1000;
++      const uint64_t floor = (uint64_t) va_vbv_floor(p->bitrate, s->fps);
++      if (vbv_bits < floor)
++         vbv_bits = floor;
++      if (vbv_bits > UINT32_MAX)
++         vbv_bits = UINT32_MAX;
++      uint8_t hpar[sizeof(VAEncMiscParameterBuffer) + sizeof(VAEncMiscParameterHRD)];
++      VAEncMiscParameterBuffer *hmisc = (VAEncMiscParameterBuffer *) hpar;
++      VAEncMiscParameterHRD hrd;
++      memset(&hrd, 0, sizeof(hrd));
++      hrd.buffer_size = (uint32_t) vbv_bits;
++      hrd.initial_buffer_fullness = (uint32_t) (vbv_bits * 3 / 4);
++      hmisc->type = VAEncMiscParameterTypeHRD;
++      memcpy(hmisc->data, &hrd, sizeof(hrd));
++      VA_CREATE(VAEncMiscParameterBufferType, hpar, sizeof(hpar));
++
++      /* 4. frame rate, so the rate controller budgets per frame correctly */
++      uint8_t fpar[sizeof(VAEncMiscParameterBuffer) +
++                   sizeof(VAEncMiscParameterFrameRate)];
++      VAEncMiscParameterBuffer *fmisc = (VAEncMiscParameterBuffer *) fpar;
++      VAEncMiscParameterFrameRate fr;
++      memset(&fr, 0, sizeof(fr));
++      /* Nominal fps unless the stream is actually slower: the number here is
++       * the divisor the rate controller uses for its per-frame budget, so a
++       * 90 fps constant caps the delivered rate at (real/90) of the target.
++       * p->rc_fps is the *stream* rate, not this session's own arrival rate:
++       * the three sessions together receive every picture, each one receives
++       * only one in three. */
++      uint32_t rc_fps = p->rc_fps ? p->rc_fps : s->fps;
++      if (rc_fps < 1)
++         rc_fps = 1;
++      fr.framerate = (1u << 16) | rc_fps;
++      fmisc->type = VAEncMiscParameterTypeFrameRate;
++      memcpy(fmisc->data, &fr, sizeof(fr));
++      VA_CREATE(VAEncMiscParameterBufferType, fpar, sizeof(fpar));
++      {
++         static int64_t last_ns;
++         static uint32_t last_rc_fps;
++         const int64_t t = os_time_get_nano();
++         if (rc_fps != last_rc_fps && t - last_ns > 1000000000ll) {
++            last_ns = t;
++            last_rc_fps = rc_fps;
++            VLOG("rate: rc fps %u (nominal %u, stream measured %.1f) -> per-frame "
++                 "budget %llu B", rc_fps, s->fps, g_stream.fps_meas,
++                 (unsigned long long) (p->bitrate / 8 / rc_fps));
++         }
++      }
++   }
++
++   /* 5. picture parameters */
++   VASurfaceID recon = s->recon[s->recon_pos++ % VA_RECON_SURFACES];
++   VABufferID coded = s->coded[s->coded_pos++ % VA_CODED_BUFFERS];
++   VAEncPictureParameterBufferHEVC pic;
++   memset(&pic, 0, sizeof(pic));
++   pic.decoded_curr_pic.picture_id = recon;
++   pic.decoded_curr_pic.flags = 0;
++   for (int i = 0; i < 15; i++) {
++      pic.reference_frames[i].picture_id = VA_INVALID_ID;
++      pic.reference_frames[i].flags = VA_PICTURE_HEVC_INVALID;
++   }
++   pic.coded_buf = coded;
++   pic.collocated_ref_pic_index = s->temporal_mvp ? 0 : 0xff;
++   pic.pic_init_qp = init_qp;
++   pic.diff_cu_qp_delta_depth = s->rc_mode == VA_RC_CQP ? 0 : VA_HEVC_DIFF_CU_QP;
++   pic.num_ref_idx_l0_default_active_minus1 = 0;
++   pic.num_ref_idx_l1_default_active_minus1 = 0;
++   pic.slice_pic_parameter_set_id = 0;
++   pic.nal_unit_type = VA_HEVC_NAL_IDR_W_RADL;
++   pic.pic_fields.bits.idr_pic_flag = 1;
++   pic.pic_fields.bits.coding_type = 1;              /* I */
++   pic.pic_fields.bits.reference_pic_flag = 1;
++   pic.pic_fields.bits.transform_skip_enabled_flag = 1;
++   pic.pic_fields.bits.cu_qp_delta_enabled_flag = s->rc_mode != VA_RC_CQP;
++   pic.pic_fields.bits.pps_loop_filter_across_slices_enabled_flag = 1;
++   VA_CREATE(VAEncPictureParameterBufferType, &pic, sizeof(pic));
++
++   /* 6/7. packed VPS/SPS/PPS, the same bytes handed to the application */
++   if (s->packed_headers) {
++      VAEncPackedHeaderParameterBuffer ph;
++      memset(&ph, 0, sizeof(ph));
++      ph.type = VAEncPackedHeaderSequence;
++      ph.bit_length = (uint32_t) s->headers_size * 8;
++      /* 1 = the data already carries emulation prevention bytes.  With 0,
++       * iHD inserts them again: the VPS/SPS/PPS blob then arrives as one
++       * mangled NAL unit 11 bytes too long and with no PPS at all. */
++      ph.has_emulation_bytes = 1;
++      VA_CREATE(VAEncPackedHeaderParameterBufferType, &ph, sizeof(ph));
++      VA_CREATE(VAEncPackedHeaderDataBufferType, s->headers, s->headers_size);
++   }
++
++   /* 7b. packed slice headers, one per slice (see va_slice_header) */
++   {
++      uint32_t n_ctus_tmp = n_ctus;
++      uint32_t addr_bits = 0;
++      while ((1u << addr_bits) < n_ctus_tmp)
++         addr_bits++;
++      for (uint32_t i = 0; i < p->n_slices; i++) {
++         uint8_t sh[64];
++         const size_t sh_len = va_slice_header(sh, sizeof(sh), s,
++                                               p->slice_addr[i], i == 0,
++                                               addr_bits, 0);
++         if (!sh_len)
++            goto fail;
++         VAEncPackedHeaderParameterBuffer ph;
++         memset(&ph, 0, sizeof(ph));
++         ph.type = VAEncPackedHeaderHEVC_Slice;
++         ph.bit_length = (uint32_t) sh_len * 8;
++         ph.has_emulation_bytes = 1;   /* va_nal() already inserted them */
++         VA_CREATE(VAEncPackedHeaderParameterBufferType, &ph, sizeof(ph));
++         VA_CREATE(VAEncPackedHeaderDataBufferType, sh, sh_len);
++      }
++   }
++
++   /* 8. slice parameters: the application's own boundaries.  iHD's hardware
++    * path is row based (Slicestartctby = slice_segment_address / widthInCtb)
++    * and accepts any row-aligned split, so these four are what actually gets
++    * encoded. */
++   for (uint32_t i = 0; i < p->n_slices; i++) {
++      const uint32_t next = i + 1 < p->n_slices ? p->slice_addr[i + 1] : n_ctus;
++      VAEncSliceParameterBufferHEVC sl;
++      memset(&sl, 0, sizeof(sl));
++      sl.slice_segment_address = p->slice_addr[i];
++      sl.num_ctu_in_slice = next > p->slice_addr[i] ? next - p->slice_addr[i] : 0;
++      sl.slice_type = VA_HEVC_SLICE_I;
++      sl.slice_pic_parameter_set_id = 0;
++      sl.num_ref_idx_l0_active_minus1 = 0;
++      sl.num_ref_idx_l1_active_minus1 = 0;
++      sl.max_num_merge_cand = 5;
++      sl.slice_qp_delta = 0;
++      sl.slice_fields.bits.last_slice_of_pic_flag = i + 1 == p->n_slices;
++      sl.slice_fields.bits.slice_temporal_mvp_enabled_flag = s->temporal_mvp;
++      sl.slice_fields.bits.slice_sao_luma_flag = s->sao;
++      sl.slice_fields.bits.slice_sao_chroma_flag = s->sao;
++      sl.slice_fields.bits.collocated_from_l0_flag = 1;
++      for (int k = 0; k < 15; k++) {
++         sl.ref_pic_list0[k].picture_id = VA_INVALID_ID;
++         sl.ref_pic_list0[k].flags = VA_PICTURE_HEVC_INVALID;
++         sl.ref_pic_list1[k].picture_id = VA_INVALID_ID;
++         sl.ref_pic_list1[k].flags = VA_PICTURE_HEVC_INVALID;
++      }
++      VA_CREATE(VAEncSliceParameterBufferType, &sl, sizeof(sl));
++   }
++
++   st = vaBeginPicture(s->dpy, s->ctx, src);
++   if (st != VA_STATUS_SUCCESS) {
++      VLOG("vaBeginPicture failed: %d (%s)", st, vaErrorStr(st));
++      goto fail;
++   }
++   st = vaRenderPicture(s->dpy, s->ctx, bufs, nbuf);
++   if (st != VA_STATUS_SUCCESS) {
++      VLOG("vaRenderPicture failed: %d (%s)", st, vaErrorStr(st));
++      vaEndPicture(s->dpy, s->ctx);
++      goto fail;
++   }
++   st = vaEndPicture(s->dpy, s->ctx);
++   if (st != VA_STATUS_SUCCESS) {
++      VLOG("vaEndPicture failed: %d (%s)", st, vaErrorStr(st));
++      goto fail;
++   }
++   st = vaSyncSurface(s->dpy, recon);
++   if (st != VA_STATUS_SUCCESS) {
++      VLOG("vaSyncSurface failed: %d (%s)", st, vaErrorStr(st));
++      goto fail;
++   }
++
++   for (uint32_t i = 0; i < ntmp; i++)
++      vaDestroyBuffer(s->dpy, tmp[i]);
++   s->frames++;
++   *recon_out = recon;
++   return coded;
++
++fail:
++   for (uint32_t i = 0; i < ntmp; i++)
++      vaDestroyBuffer(s->dpy, tmp[i]);
++   return VA_INVALID_ID;
++}
++
++/* ==== Slice layout: emit exactly the slices the application asked for ====
++ *
++ * SteamVR (vrlink) asks for one slice per atlas view through
++ * VkVideoEncodeH265PictureInfoKHR::pNaluSliceSegmentEntries[].  The request
++ * reaches us as a count plus one slice_segment_address per slice.
++ *
++ * iHD's hardware path is row based (Slicestartctby = slice_segment_address /
++ * widthInCtb) and its DDI copies the application's slice_segment_address and
++ * num_ctu_in_slice verbatim, rejecting only row-unaligned slices.  Measured on
++ * this GPU: given ARBITRARY_ROWS it emits exactly 4 row-aligned slices at CTU
++ * addresses 0/256/512/768.
++ *
++ * anv_va_encode_job() builds one VAEncSliceParameterBufferHEVC per requested
++ * slice with the application's own boundaries; the bitstream is parsed back
++ * and compared with the request (va_log_slice_layout), so a mismatch is
++ * reported rather than assumed away.
++ */
++
++/* Honouring the application's slice layout is the default; opt out with
++ * ANV_VA_NO_SLICE_LAYOUT=1. */
++static bool va_slice_layout_enabled(void)
++{
++   static int disabled = -1;
++   if (disabled < 0)
++      disabled = va_env_flag("ANV_VA_NO_SLICE_LAYOUT");
++   return !disabled;
++}
++
++/* ---- Bitstream read-back: what did the encoder actually emit? ---- */
++
++struct va_br {
++   const uint8_t *d;
++   int pos, bits;
++};
++
++static uint32_t va_br_bit(struct va_br *b)
++{
++   if (b->pos >= b->bits)
++      return 0;
++   uint32_t v = (b->d[b->pos >> 3] >> (7 - (b->pos & 7))) & 1;
++   b->pos++;
++   return v;
++}
++
++static uint32_t va_br_bits(struct va_br *b, int n)
++{
++   uint32_t v = 0;
++   for (int i = 0; i < n; i++)
++      v = (v << 1) | va_br_bit(b);
++   return v;
++}
++
++static uint32_t va_br_ue(struct va_br *b)
++{
++   int z = 0;
++   while (b->pos < b->bits && !va_br_bit(b) && z < 32)
++      z++;
++   if (z >= 32)
++      return 0;
++   return ((1u << z) - 1) + (z ? va_br_bits(b, z) : 0);
++}
++
++/* Copy a NAL unit's payload with emulation-prevention bytes removed. */
++static int va_rbsp(const uint8_t *nal, int n, uint8_t *out, int out_size)
++{
++   int o = 0, zeros = 0;
++   for (int i = 2; i < n && o < out_size; i++) {        /* skip NAL header */
++      if (zeros >= 2 && nal[i] == 3) {
++         zeros = 0;
++         continue;
++      }
++      out[o++] = nal[i];
++      zeros = (nal[i] == 0) ? zeros + 1 : 0;
++   }
++   return o;
++}
++
++/* Walk Annex B start codes.  Returns the payload offset of NAL k, or -1. */
++static int va_nal_walk(const uint8_t *d, int n, int *cursor,
++                       int *payload, int *end)
++{
++   int i = *cursor;
++   while (i + 3 <= n) {
++      int sc;
++      if (d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1)
++         sc = 3;
++      else if (i + 4 <= n && d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 0 &&
++               d[i + 3] == 1)
++         sc = 4;
++      else {
++         i++;
++         continue;
++      }
++      int e = i + sc;
++      while (e + 3 <= n) {
++         if (d[e] == 0 && d[e + 1] == 0 &&
++             (d[e + 2] == 1 || (e + 4 <= n && d[e + 2] == 0 && d[e + 3] == 1)))
++            break;
++         e++;
++      }
++      if (e + 3 > n)
++         e = n;
++      while (e > i + sc && d[e - 1] == 0)
++         e--;
++      *payload = i + sc;
++      *end = e;
++      *cursor = e;
++      return (d[i + sc] >> 1) & 0x3f;
++   }
++   return -1;
++}
++
++/* Everything the slice-header parse needs, taken from the stream's own SPS and
++ * PPS (never from a constant): CTU size, picture size in CTUs, and whether
++ * dependent slice segments are enabled. */
++struct va_hevc_geom {
++   uint32_t width, height, ctb_log2, pic_w_ctbs, pic_h_ctbs, n_ctus, addr_bits;
++   uint32_t dependent_slices;
++   bool valid;
++};
++
++static void va_parse_sps(const uint8_t *rbsp, int n, struct va_hevc_geom *g)
++{
++   struct va_br b = { rbsp, 0, n * 8 };
++   va_br_bits(&b, 4);                       /* sps_video_parameter_set_id */
++   const uint32_t max_sub = va_br_bits(&b, 3);
++   va_br_bits(&b, 1);                       /* sps_temporal_id_nesting_flag */
++
++   /* profile_tier_level(1, max_sub) */
++   va_br_bits(&b, 2 + 1 + 5 + 32 + 48 + 8);
++   uint32_t sub_prof = 0, sub_lev = 0;
++   for (uint32_t i = 0; i < max_sub; i++) {
++      sub_prof |= va_br_bit(&b) << i;
++      sub_lev |= va_br_bit(&b) << i;
++   }
++   if (max_sub) {
++      for (uint32_t i = max_sub; i < 8; i++)
++         va_br_bits(&b, 2);                 /* reserved_zero_2bits */
++   }
++   for (uint32_t i = 0; i < max_sub; i++) {
++      if (sub_prof & (1u << i))
++         va_br_bits(&b, 2 + 1 + 5 + 32 + 48);
++      if (sub_lev & (1u << i))
++         va_br_bits(&b, 8);
++   }
++
++   va_br_ue(&b);                            /* sps_seq_parameter_set_id */
++   const uint32_t chroma = va_br_ue(&b);
++   if (chroma == 3)
++      va_br_bit(&b);                        /* separate_colour_plane_flag */
++   g->width = va_br_ue(&b);
++   g->height = va_br_ue(&b);
++   if (va_br_bit(&b))                       /* conformance_window_flag */
++      for (int i = 0; i < 4; i++)
++         va_br_ue(&b);
++   va_br_ue(&b);                            /* bit_depth_luma_minus8 */
++   va_br_ue(&b);                            /* bit_depth_chroma_minus8 */
++   va_br_ue(&b);                            /* log2_max_pic_order_cnt_lsb_minus4 */
++   const uint32_t sub_ordering = va_br_bit(&b);
++   for (uint32_t i = sub_ordering ? 0 : max_sub; i <= max_sub; i++) {
++      va_br_ue(&b);                         /* max_dec_pic_buffering_minus1 */
++      va_br_ue(&b);                         /* max_num_reorder_pics */
++      va_br_ue(&b);                         /* max_latency_increase_plus1 */
++   }
++   const uint32_t log2_min = va_br_ue(&b) + 3;
++   const uint32_t log2_diff = va_br_ue(&b);
++   g->ctb_log2 = log2_min + log2_diff;
++   g->valid = g->width && g->height && g->ctb_log2 >= 4 && g->ctb_log2 <= 6;
++}
++
++static void va_parse_pps(const uint8_t *rbsp, int n, struct va_hevc_geom *g)
++{
++   struct va_br b = { rbsp, 0, n * 8 };
++   va_br_ue(&b);                            /* pps_pic_parameter_set_id */
++   va_br_ue(&b);                            /* pps_seq_parameter_set_id */
++   g->dependent_slices = va_br_bit(&b);
++}
++
++static bool va_hevc_geom_from_headers(const uint8_t *d, int n,
++                                      struct va_hevc_geom *g)
++{
++   uint8_t rbsp[2048];
++   int cursor = 0, payload, end, sps = 0, pps = 0;
++
++   memset(g, 0, sizeof *g);
++   while (1) {
++      const int type = va_nal_walk(d, n, &cursor, &payload, &end);
++      if (type < 0)
++         break;
++      const int len = va_rbsp(d + payload, end - payload, rbsp, sizeof rbsp);
++      if (type == 33 && !sps) {             /* SPS */
++         va_parse_sps(rbsp, len, g);
++         sps = 1;
++      } else if (type == 34 && !pps) {      /* PPS */
++         va_parse_pps(rbsp, len, g);
++         pps = 1;
++      }
++   }
++   if (!g->valid)
++      return false;
++   const uint32_t ctb = 1u << g->ctb_log2;
++   g->pic_w_ctbs = (g->width + ctb - 1) / ctb;
++   g->pic_h_ctbs = (g->height + ctb - 1) / ctb;
++   g->n_ctus = g->pic_w_ctbs * g->pic_h_ctbs;
++   g->addr_bits = 1;
++   while ((1u << g->addr_bits) < g->n_ctus)
++      g->addr_bits++;
++   return true;
++}
++
++/* slice_segment_header() up to slice_segment_address (H.265 7.3.6.1):
++ *   first_slice_segment_in_pic_flag u(1)
++ *   [no_output_of_prior_pics_flag u(1) for IRAP]
++ *   slice_pic_parameter_set_id ue(v)
++ *   [dependent_slice_segment_flag u(1)]
++ *   slice_segment_address u(ceil(log2(PicSizeInCtbsY)))
++ * The address is absent (implicitly 0) for the first slice of a picture. */
++static uint32_t va_parse_slice_addr(const uint8_t *nal, int n,
++                                    const struct va_hevc_geom *g)
++{
++   uint8_t rbsp[512];
++   const int len = va_rbsp(nal, n, rbsp, sizeof rbsp);
++   struct va_br b = { rbsp, 0, len * 8 };
++   const uint32_t first = va_br_bit(&b);
++   if (((nal[0] >> 1) & 0x3f) >= 16)        /* IRAP */
++      va_br_bit(&b);
++   va_br_ue(&b);                            /* slice_pic_parameter_set_id */
++   if (first)
++      return 0;
++   if (g->dependent_slices)
++      va_br_bit(&b);                        /* dependent_slice_segment_flag */
++   return va_br_bits(&b, g->addr_bits);
++}
++
++/* The application's numbers are luma-row offsets when they cannot be CTU
++ * addresses; otherwise the spec-literal reading wins.  See CHECKPOINT.md for
++ * why vrlink passes row offsets (one per 1024-row atlas view). */
++static bool va_app_addrs_are_rows(const struct va_hevc_geom *g)
++{
++   if (!g->valid || !g_app_slice_addr_count)
++      return false;
++   for (uint32_t i = 0; i < g_app_slice_addr_count; i++)
++      if (g_app_slice_addr[i] >= g->n_ctus)
++         return true;
++   return false;
++}
++
++static uint32_t va_row_to_ctu(uint32_t row, const struct va_hevc_geom *g)
++{
++   const uint32_t ctb = 1u << g->ctb_log2;
++   return (row / ctb) * g->pic_w_ctbs;
++}
++
++/* Parse the produced packet and log what it really contains, next to what the
++ * application asked for.  This is the proof line:
++ *   slices: app 4 @0,1024,2048,3072 (rows) -> ctu 0,256,512,768,
++ *           bitstream 4 @0,256,512,768
++ */
++static void va_log_slice_layout(const uint8_t *pkt, int size)
++{
++   /* iHD writes VPS/SPS/PPS into every packet, so the geometry comes from the
++    * stream itself; the copy is kept for packets that omit the parameter sets
++    * (the application's copy is PS-stripped, but this is the raw packet). */
++   static struct va_hevc_geom cached;
++   struct va_hevc_geom g;
++   if (va_hevc_geom_from_headers(pkt, size, &g) && g.valid) {
++      cached = g;
++   } else if (cached.valid) {
++      g = cached;
++   } else {
++      static bool warned;
++      if (!warned) {
++         warned = true;
++         VLOG("slice layout: no SPS in the packet yet; cannot verify layout");
++      }
++      return;
++   }
++
++   uint32_t addr[80];
++   uint32_t sizes[80];
++   uint32_t naddr = 0;
++   int cursor = 0, payload, end;
++   uint32_t nvcl = 0;
++
++   while (naddr < ARRAY_SIZE(addr)) {
++      const int type = va_nal_walk(pkt, size, &cursor, &payload, &end);
++      if (type < 0)
++         break;
++      if (type > 31)
++         continue;
++      nvcl++;
++      addr[naddr] = va_parse_slice_addr(pkt + payload, end - payload, &g);
++      sizes[naddr] = (uint32_t) (end - payload);
++      naddr++;
++   }
++
++   char app[256], ctu[256];
++   size_t ao = 0, co = 0;
++   const bool rows = va_app_addrs_are_rows(&g);
++   for (uint32_t i = 0; i < g_app_slice_addr_count && ao + 12 < sizeof app; i++)
++      ao += snprintf(app + ao, sizeof app - ao, "%s%u", i ? "," : "",
++                     g_app_slice_addr[i]);
++   for (uint32_t i = 0; i < g_app_slice_addr_count && co + 12 < sizeof ctu; i++)
++      co += snprintf(ctu + co, sizeof ctu - co, "%s%u", i ? "," : "",
++                     rows ? va_row_to_ctu(g_app_slice_addr[i], &g)
++                          : g_app_slice_addr[i]);
++
++   /* An application that requests no slices is not a mismatch: the encoder
++    * chooses, and we only report what it did. */
++   bool same = g_app_slices == 0 || (nvcl == g_app_slices && nvcl == naddr);
++   for (uint32_t i = 0; same && i < naddr; i++)
++      same = addr[i] == (rows ? va_row_to_ctu(g_app_slice_addr[i], &g)
++                              : (i < g_app_slice_addr_count ? g_app_slice_addr[i]
++                                                            : addr[i]));
++
++   char bs[256];
++   size_t bo = 0;
++   for (uint32_t i = 0; i < naddr && bo + 12 < sizeof bs; i++)
++      bo += snprintf(bs + bo, sizeof bs - bo, "%s%u", i ? "," : "", addr[i]);
++
++   /* `TRUNCATED:` was retired: the NAL-size ratio cannot tell a complete but
++    * short last slice from a cut one (40-AU capture at 250 Mbit/s: 4/4 VCL,
++    * clean ffmpeg decode).  Slice completeness is validated externally
++    * (hevc_slices.py / sliceview.py --verify).  The `slices:` line below
++    * still parses the bitstream NALs and compares their addresses with the
++    * application's request. */
++   /* Dedup: one line per distinct outcome, not per frame. */
++   static char last[768];
++   char line[768];
++   snprintf(line, sizeof line,
++            "slices: app %u @%s%s -> ctu %s, bitstream %u @%s%s",
++            g_app_slices, app, rows ? " (rows)" : "", ctu, nvcl, bs,
++            same ? "" : " (MISMATCH)");
++   if (strcmp(line, last) != 0) {
++      snprintf(last, sizeof last, "%s", line);
++      VLOG("%s", line);
++   }
++}
++
++static int strip_ps(const uint8_t *d, int n, uint8_t *out) {
++   int i = 0, o = 0;
++   while (i + 4 < n) {
++      int sc;
++      if (d[i] == 0 && d[i+1] == 0 && d[i+2] == 1) sc = 3;
++      else if (d[i] == 0 && d[i+1] == 0 && d[i+2] == 0 && d[i+3] == 1) sc = 4;
++      else { i++; continue; }
++      int off = i + sc;
++      if (off + 2 > n) break;
++      int type = (d[off] >> 1) & 0x3f;
++      int j = off + 2;
++      while (j + 3 < n && !(d[j] == 0 && d[j+1] == 0 &&
++             (d[j+2] == 1 || (d[j+2] == 0 && d[j+3] == 1)))) j++;
++      if (j + 3 >= n) j = n;
++      if (type != 32 && type != 33 && type != 34) {
++         memcpy(out + o, d + i, j - i); o += j - i;
++      }
++      i = j;
++   }
++   return o;
++}
++
++static void extract_ps(const uint8_t *d, int n, uint8_t **out, size_t *out_size) {
++   *out = NULL; *out_size = 0;
++   int i = 0;
++   while (i + 4 < n) {
++      int sc;
++      if (d[i] == 0 && d[i+1] == 0 && d[i+2] == 1) sc = 3;
++      else if (d[i] == 0 && d[i+1] == 0 && d[i+2] == 0 && d[i+3] == 1) sc = 4;
++      else { i++; continue; }
++      int off = i + sc;
++      if (off + 2 > n) break;
++      int type = (d[off] >> 1) & 0x3f;
++      int j = off + 2;
++      while (j + 3 < n && !(d[j] == 0 && d[j+1] == 0 &&
++             (d[j+2] == 1 || (d[j+2] == 0 && d[j+3] == 1)))) j++;
++      if (j + 3 >= n) j = n;
++      if (type == 32 || type == 33 || type == 34) {
++         size_t add = (size_t)(j - i);
++         uint8_t *tmp = realloc(*out, *out_size + add);
++         if (!tmp) return;
++         memcpy(tmp + *out_size, d + i, add);
++         *out = tmp; *out_size += add;
++      }
++      i = j;
++   }
++}
++
++size_t anv_va_headers_from_params(struct vk_video_session_parameters *params,
++                                  size_t size_limit, void *data) {
++   if (params->op != VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR ||
++       params->h265_enc.h265_sps_count == 0)
++      return 0;
++   const StdVideoH265SequenceParameterSet *sps = &params->h265_enc.h265_sps[0].base;
++   uint32_t w = sps->pic_width_in_luma_samples;
++   uint32_t h = sps->pic_height_in_luma_samples;
++   VLOG("SPS w=%u h=%u cropflag=%u l=%u r=%u t=%u b=%u chroma=%d",
++        sps->pic_width_in_luma_samples, sps->pic_height_in_luma_samples,
++        sps->flags.conformance_window_flag, sps->conf_win_left_offset,
++        sps->conf_win_right_offset, sps->conf_win_top_offset,
++        sps->conf_win_bottom_offset, sps->chroma_format_idc);
++   if (sps->flags.conformance_window_flag) {
++      uint32_t subw = sps->chroma_format_idc == 1 ? 2 : 1;
++      uint32_t subh = sps->chroma_format_idc == 1 ? 2 : 1;
++      w -= subw * (sps->conf_win_left_offset + sps->conf_win_right_offset);
++      h -= subh * (sps->conf_win_top_offset + sps->conf_win_bottom_offset);
++   }
++   bool ten_bit = sps->bit_depth_luma_minus8 > 0;
++   VkFormat fmt = ten_bit ? VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16
++                          : VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
++   uint32_t fps = 90;
++   if (sps->pSequenceParameterSetVui && sps->pSequenceParameterSetVui->vui_num_units_in_tick)
++      fps = sps->pSequenceParameterSetVui->vui_time_scale /
++            sps->pSequenceParameterSetVui->vui_num_units_in_tick;
++   if (va_pending && va_pending_fmt == fmt && va_pending_w == w &&
++       va_pending_h == h && va_pending->headers) {
++      size_t ret = va_pending->headers_size;
++      if (data && size_limit >= ret) memcpy(data, va_pending->headers, ret);
++      return ret;
++   }
++   /* The parameter sets are written here, by the same code that feeds them
++    * to the encoder as a packed header, so the application's out-of-band
++    * copy and the in-band one cannot disagree.  No dummy encode is needed
++    * (the VPS/SPS/PPS are built directly, so no dummy encode is needed). */
++   struct anv_va_session *s = backend_create(fmt, w, h, fps, NULL, NULL, NULL);
++   if (!s) return 0;
++   va_pending = s; va_pending_fmt = fmt;
++   va_pending_w = w; va_pending_h = h;
++   size_t ret = s->headers_size;
++   if (data && size_limit >= ret) memcpy(data, s->headers, ret);
++   VLOG("VA headers %zu bytes (generated, no dummy encode)", ret);
++   return ret;
++}
++
++static struct anv_va_session *va_set_primary(const struct va_sessions *set)
++{
++   if (!set)
++      return NULL;
++   for (unsigned i = 0; i < VA_SLOT_COUNT; i++)
++      if (set->slot[i])
++         return set->slot[i];
++   return NULL;
++}
++
++/* Which destination slot a frame belongs to.  Routing is by the offset the
++ * application asked for and nothing else: 0 -> 0, 4 M -> 1, 8 M -> 2.  The
++ * offset passed back to the application in the feedback entry is the same
++ * one, so the driver never moves a payload away from the slot the
++ * application will read. */
++static uint32_t va_slot_of(VkDeviceSize dst_offset)
++{
++   const uint32_t slot = (uint32_t) (dst_offset / VA_SLOT_BYTES);
++   return slot < VA_SLOT_COUNT ? slot : 0;
++}
++
++/* Create every existing slot's context again, applying the current options.
++ * Used for a rate-control-mode change, which needs a new VAConfig: the three
++ * sessions must be reopened together or two of them would keep encoding with
++ * a different PPS (cu_qp_delta) and different headers from the out-of-band
++ * copy.  The first new session is built from the current options; the others
++ * clone it. */
++static bool va_set_reopen(struct va_sessions *set, struct anv_device *device)
++{
++   struct anv_va_session *fresh[VA_SLOT_COUNT] = { NULL };
++   struct anv_va_session *first = NULL;
++
++   for (unsigned i = 0; i < VA_SLOT_COUNT; i++) {
++      if (!set->slot[i])
++         continue;
++      struct anv_va_session *n = backend_create(set->fmt, set->w, set->h,
++                                                first ? first->fps : 0,
++                                                device, set, first);
++      if (!n) {
++         for (unsigned j = 0; j < VA_SLOT_COUNT; j++)
++            backend_destroy(fresh[j]);
++         VLOG("slot reopen failed for slot %u; keeping the old contexts", i);
++         return false;
++      }
++      n->slot = i;
++      fresh[i] = n;
++      if (!first)
++         first = n;
++   }
++   for (unsigned i = 0; i < VA_SLOT_COUNT; i++) {
++      if (!fresh[i])
++         continue;
++      backend_destroy(set->slot[i]);
++      set->slot[i] = fresh[i];
++   }
++   return true;
++}
++
++/* Resolve (creating on demand) the encoder context for one destination slot.
++ *
++ * The first slot the application uses adopts the header-only session built by
++ * anv_va_headers_from_params() instead of opening a fourth context.  Slots
++ * 1/2 are created the first time a frame lands in them, cloning slot 0's
++ * configuration and parameter sets.  If a context cannot be created, the
++ * frame is encoded on the primary session (the old single-session behaviour)
++ * rather than being dropped.
++ */
++static struct anv_va_session *va_session_get_locked(struct anv_video_session *vid,
++                                                    VkFormat fmt, uint32_t w,
++                                                    uint32_t h, uint32_t slot) {
++   struct va_sessions *set = vid->va;
++   struct anv_device *device;
++
++   if (slot >= VA_SLOT_COUNT)
++      slot = 0;
++   if (!set || set->fmt != fmt || set->w != w || set->h != h) {
++      /* A reconfiguration (or the first frame): the old contexts belong to a
++       * different format/extent and cannot be reused.  The worker is a single
++       * thread, so no other job can be using them here. */
++      if (set) {
++         for (unsigned i = 0; i < VA_SLOT_COUNT; i++)
++            backend_destroy(set->slot[i]);
++         if (set->dpy)
++            vaTerminate(set->dpy);
++         if (set->drm_fd >= 0)
++            close(set->drm_fd);
++         free(set);
++      }
++      set = calloc(1, sizeof(*set));
++      if (!set)
++         return NULL;
++      set->fmt = fmt; set->w = w; set->h = h;
++      vid->va = set;
++   }
++   if (set->slot[slot])
++      return set->slot[slot];
++   /* A slot that already failed stays on the primary context: retrying the
++    * creation every frame would stall the worker on a configuration the
++    * driver cannot open. */
++   if (set->slot_failed[slot])
++      return va_set_primary(set);
++
++   device = container_of(vid->vk.base.device, struct anv_device, vk);
++   struct anv_va_session *templ = va_set_primary(set);
++   struct anv_va_session *s = NULL;
++   if (!templ && va_pending && va_pending_fmt == fmt &&
++       va_pending_w == w && va_pending_h == h) {
++      s = va_pending;
++      va_pending = NULL;
++      /* The header-only session brought its own display; hand it to the set
++       * so the other slot contexts can share it. */
++      if (set->dpy && set->dpy != s->dpy) {
++         VLOG("slot %u: pending session uses another display; reopening on "
++              "the shared one", slot);
++         backend_destroy(s);
++         s = NULL;
++      } else if (s->owns_dpy) {
++         set->dpy = s->dpy;
++         set->drm_fd = s->drm_fd;
++         s->drm_fd = -1;
++         s->owns_dpy = false;
++      }
++   }
++   if (!s)
++      s = backend_create(fmt, w, h, templ ? templ->fps : 0, device, set, templ);
++   if (!s) {
++      /* Fall back to the primary context rather than dropping the frame.
++       * Do not retry the creation on every frame: that would stall the
++       * worker on a configuration the driver cannot open. */
++      if (!set->slot_failed[slot]) {
++         set->slot_failed[slot] = true;
++         VLOG("slot %u: encoder context creation failed; falling back to the "
++              "primary session (single-session behaviour)", slot);
++      }
++      return va_set_primary(set);
++   }
++   s->slot = slot;
++   /* A pending session was built before the template existed and may have
++    * picked a different level/fps from the current bitrate; align it with the
++    * template's parameter sets before it is used. */
++   if (templ && templ->headers && templ->headers_size &&
++       (s->headers_size != templ->headers_size ||
++        memcmp(s->headers, templ->headers, s->headers_size) != 0)) {
++      free(s->headers);
++      s->headers = malloc(templ->headers_size);
++      if (!s->headers) {
++         s->headers_size = 0;
++         backend_destroy(s);
++         set->slot_failed[slot] = true;
++         return va_set_primary(set);
++      }
++      memcpy(s->headers, templ->headers, templ->headers_size);
++      s->headers_size = templ->headers_size;
++      s->fps = templ->fps;
++      s->level_idc = templ->level_idc;
++      VLOG("slot %u: adopted the template's parameter sets and level", slot);
++   }
++   set->slot[slot] = s;
++   VLOG("slot %u: own encoder context %p (%u contexts, %zu B headers)%s",
++        slot, (void *) s, (unsigned) (slot + 1), s->headers_size,
++        templ ? "" : " (primary)");
++   return s;
++}
++
++struct anv_va_session *anv_va_session_get(struct anv_video_session *vid,
++                                          VkFormat fmt, uint32_t w, uint32_t h,
++                                          uint32_t slot) {
++   pthread_mutex_lock(&g_set_lock);
++   struct anv_va_session *s = va_session_get_locked(vid, fmt, w, h, slot);
++   pthread_mutex_unlock(&g_set_lock);
++   return s;
++}
++
++/* dma-buf modifier for the image's ISL tiling.  The modifier is what tells
++ * the VA-API consumer how the exported BO is laid out; a tiling we cannot
++ * describe is refused (DRM_FORMAT_MOD_INVALID) instead of being handed over
++ * with a wrong layout. */
++static uint64_t isl_modifier(enum isl_tiling tiling)
++{
++   switch (tiling) {
++   case ISL_TILING_LINEAR: return DRM_FORMAT_MOD_LINEAR;
++   case ISL_TILING_Y0:     return I915_FORMAT_MOD_Y_TILED;
++   case ISL_TILING_SKL_Yf: return I915_FORMAT_MOD_Yf_TILED;
++   case ISL_TILING_ICL_Yf: return I915_FORMAT_MOD_Yf_TILED;
++   case ISL_TILING_4:      return I915_FORMAT_MOD_4_TILED;
++   default:                return DRM_FORMAT_MOD_INVALID;
++   }
++}
++
++
++void anv_va_encode_job(struct anv_device *device, struct anv_video_session *vid,
++                       struct anv_va_job *job) {
++
++   VkDevice dev = anv_device_to_handle(device);
++   int pair_idx = -1;
++   const int64_t t_start = os_time_get_nano();
++   if (!vid || !job->src_view || !job->dst_buffer) return;
++   ANV_FROM_HANDLE(anv_image_view, iv, job->src_view);
++   ANV_FROM_HANDLE(anv_buffer, buf, job->dst_buffer);
++   /* Route by the offset the application asked for: 0 -> session 0,
++    * 4 M -> session 1, 8 M -> session 2.  The offset is not remapped.  The
++    * feedback entry must carry the application's own offset, or it reads a
++    * different slot than the one that was written; the slot swap measured
++    * earlier produced valid bytes with the wrong frame identity for exactly
++    * that reason.  The 0/3M/6M compaction and the /tmp/va_dst0 and
++    * /tmp/va_dst_map hooks are gone: moving payloads is not a fix. */
++   const uint32_t slot = va_slot_of(job->dst_offset);
++   const VkDeviceSize dst_off = job->dst_offset;
++   const struct anv_image *img = iv->image;
++   struct anv_va_session *s = anv_va_session_get(vid, img->vk.format,
++                                                 job->width, job->height, slot);
++   if (!s || !s->ready) return;
++
++   /* Stream frame rate, shared by all three sessions (see g_stream).  Each
++    * session sees one frame in three, and the frame-rate parameter is the
++    * divisor iHD uses for its per-frame budget: measuring it per session
++    * would tell each one 30 fps and triple the delivered rate. */
++   pthread_mutex_lock(&g_stream_lock);
++   {
++      const int64_t t = os_time_get_nano();
++      if (g_stream.last_frame_ns && t > g_stream.last_frame_ns) {
++         const double inst = 1e9 / (double) (t - g_stream.last_frame_ns);
++         if (inst > 0.5 && inst < 240.0)
++            g_stream.fps_meas = g_stream.fps_meas > 0.0
++               ? g_stream.fps_meas * 0.9 + inst * 0.1 : inst;
++      }
++      g_stream.last_frame_ns = t;
++   }
++   if (s->slot != slot)
++      VLOG("slot %u: encoded on the primary session (creation fallback)", slot);
++
++   /* Re-tune on the fly when the flag files change.  Only the rate-control
++    * mode and the constant QP need a new VAConfig, i.e. a reopen; the
++    * bitrate, the VBV window, the slice layout and the QP limits are
++    * per-frame parameter buffers and change without one. */
++   struct va_enc_opts want = va_enc_opts_read();
++   if (!va_enc_opts_equal(&want, &s->opts)) {
++      if (want.cqp != s->opts.cqp || want.qp != s->opts.qp) {
++         VLOG("reopening encoders for a rate-control mode change: %s qp=%u",
++              want.cqp ? "CQP" : "CBR", want.qp);
++         struct va_sessions *set = vid->va;
++         bool reopened = false;
++         pthread_mutex_lock(&g_set_lock);
++         if (set)
++            reopened = va_set_reopen(set, device);
++         if (reopened)
++            s = set->slot[slot] ? set->slot[slot] : va_set_primary(set);
++         pthread_mutex_unlock(&g_set_lock);
++         if (!s) {
++            pthread_mutex_unlock(&g_stream_lock);
++            return;
++         }
++      } else {
++         VLOG("encoder options changed: slices=%u cap=%llu bpp=%.2f "
++              "(applied per frame, no reopen)", want.slices,
++              (unsigned long long) want.bitrate_cap, want.bpp_floor);
++      }
++      /* Apply the options to every slot, not just the one that happened to
++       * encode this frame, so a context created later clones current ones. */
++      struct va_sessions *set = vid->va;
++      if (set)
++         for (unsigned i = 0; i < VA_SLOT_COUNT; i++)
++            if (set->slot[i])
++               set->slot[i]->opts = want;
++   }
++
++   /* The application's rate control is the envelope.  vrlink ramps its
++    * target from tens of Mbit/s to ~200 Mbit/s during a session; the struct
++    * used to be cached, so a change did not reach iHD without a reopen.  Now
++    * it is rebuilt per frame, so this is simply the value that goes into it. */
++   const int64_t now_ns = os_time_get_nano();
++   const uint64_t rc_floor = want.bpp_floor > 0 ?
++      (uint64_t)((double) s->w * s->h * 72 * want.bpp_floor) : 0;
++   const uint64_t rc_target = MAX2(g_rc_bitrate, rc_floor);
++   uint64_t bitrate = g_stream.bitrate ? g_stream.bitrate : s->bitrate;
++   const char *bitrate_src = g_stream.bitrate ? "held" : "startup";
++   /* The first application target of the stream is adopted unconditionally,
++    * deadband or not.  This latch is stream-wide: with one per session the
++    * three contexts could each latch a different step of vrlink's ramp. */
++   const bool first_app_rate = !g_stream.from_app;
++   if (g_rc_bitrate >= 1000000) {
++      bitrate = rc_target;
++      bitrate_src = "application";
++      g_stream.from_app = true;
++   }
++   if (want.bitrate_cap) {
++      bitrate = want.bitrate_cap;
++      bitrate_src = "ANV_VA_BITRATE";
++   }
++   {
++      static uint64_t last_app_rc;
++      static int64_t last_app_ns;
++      if (g_rc_bitrate >= 1000000 && g_rc_bitrate != last_app_rc &&
++          now_ns - last_app_ns > 500000000ll) {
++         last_app_rc = g_rc_bitrate;
++         last_app_ns = now_ns;
++         VLOG("app requests %llu bit/s (max %llu, vbv %u ms) -> using %llu",
++              (unsigned long long) g_rc_bitrate,
++              (unsigned long long) g_rc_max_bitrate, g_rc_vbv_ms,
++              (unsigned long long) MAX2(g_rc_bitrate, rc_floor));
++      }
++   }
++   const uint32_t vbv_ms = g_rc_vbv_ms ? g_rc_vbv_ms : 500;
++   uint64_t vbv_bits = bitrate * vbv_ms / 1000;
++   {
++      /* iHD resets its rate controller whenever the target bit rate changes
++       * (ParseMiscParams: bResetBRC, bNewSeq), and vrlink changes its target
++       * on almost every frame.  Re-submitting every 0.1 % step therefore
++       * restarts iHD's VBV state ~90 times a second, which is what the
++       * "TRUNCATED last slice" frames cluster around.  Only move the encoder
++       * when the target moves by more than the deadband; /tmp/va_rc_deadband
++       * sets the percentage (0 disables it). */
++      const uint32_t deadband = want.rc_deadband;
++      if (deadband > 0 && !first_app_rate && g_stream.bitrate &&
++          bitrate != g_stream.bitrate) {
++         const uint64_t delta = bitrate > g_stream.bitrate
++            ? bitrate - g_stream.bitrate : g_stream.bitrate - bitrate;
++         if (delta * 100 <= g_stream.bitrate * (uint64_t) deadband) {
++            bitrate = g_stream.bitrate;
++            bitrate_src = "held (deadband)";
++         }
++      }
++   }
++   {
++      /* VBV floor.  An encoder whose VBV holds less than a frame stops in the
++       * middle of the last slice when a frame does not fit and the decoder
++       * conceals the rest - the "TRUNCATED" frames.  The HRD buffer size is
++       * in BITS, so the floor is frames * (bitrate / fps) in bits;
++       * /tmp/va_vbv_frames sets the number of frames (0 disables). */
++      const int vbv_frames = (int) want.vbv_frames;
++      if (vbv_frames > 0 && s->fps) {
++         const uint64_t floor = (uint64_t) (bitrate / s->fps) * vbv_frames;
++         if (vbv_bits < floor) {
++            static int64_t last_log;
++            static uint64_t last_floor;
++            vbv_bits = floor;
++            if (floor != last_floor && now_ns - last_log > 2000000000ll) {
++               last_log = now_ns;
++               last_floor = floor;
++               VLOG("VBV floor: %llu bit/s x %u ms is under %d frame(s); using "
++                    "%llu bits (%llu B) so the last slice is not truncated",
++                    (unsigned long long) bitrate, vbv_ms, vbv_frames,
++                    (unsigned long long) floor, (unsigned long long) (floor / 8));
++            }
++         }
++      }
++   }
++   /* Log every change of the rate the encoder is told to use, throttled to
++    * 1 Hz so a swinging application target cannot flood the log.  The format
++    * is what rate_live.py and rate_report.py parse. */
++   {
++      if (bitrate != g_stream.last_logged_rate &&
++          now_ns - g_stream.last_log_ns > 1000000000ll) {
++         g_stream.last_log_ns = now_ns;
++         g_stream.last_logged_rate = bitrate;
++         VLOG("rate change: app=%llu rc_target=%llu -> enc.bit_rate=%llu "
++              "rc_max=%llu vbv=%llu fps=%u (%s, per frame, no reopen)",
++              (unsigned long long) g_rc_bitrate,
++              (unsigned long long) rc_target,
++              (unsigned long long) bitrate,
++              (unsigned long long) MAX2(g_rc_max_bitrate, bitrate),
++              (unsigned long long) vbv_bits, s->fps, bitrate_src);
++      }
++   }
++   /* Propagate the resolved target to every slot session.  Each VA-API
++    * context has its own rate controller and only sees the parameter buffer
++    * of the frame it encodes; if the application's target changes while a
++    * session is idle for a frame or two, that session must not come back
++    * with its own stale value.  The next frame it encodes is built from the
++    * same g_stream.bitrate, so all three controllers are told the same
++    * number. */
++   g_stream.bitrate = bitrate;
++   {
++      struct va_sessions *set = vid->va;
++      if (set)
++         for (unsigned i = 0; i < VA_SLOT_COUNT; i++)
++            if (set->slot[i])
++               set->slot[i]->bitrate = bitrate;
++   }
++   pthread_mutex_unlock(&g_stream_lock);
++
++   /* Source: either the image's own (tiled) BO, or the linear staging
++    * buffer the image was blitted into. */
++   ANV_FROM_HANDLE(anv_buffer, lbuf, job->linear_buf);
++   bool staged = job->linear_buf != VK_NULL_HANDLE;
++   if (staged && (lbuf == NULL || lbuf->address.bo == NULL ||
++                  lbuf->address.bo->gem_handle == 0)) {
++      /* Never hand an unexportable buffer to iHD: dma-buf export would fail
++       * and the encoder would read a bogus surface. */
++      VLOG("staging buffer has no gem handle; using the image directly");
++      staged = false;
++      job->linear_copied = true;
++   }
++   if (staged && !job->linear_copied) {
++      job->linear_copied = va_gpu_copy_linear(device, img, job);
++      if (!job->linear_copied) {
++         VLOG("staging blit failed; refusing to encode a stale buffer");
++         va_release_linear(device, job);
++         return;
++      }
++   }
++   if (staged)
++      va_check_linear(device, lbuf, job->stage_w, job->stage_h, job->stage_pitch);
++   if (staged && va_env_flag("ANV_VA_PAIR")) {
++      /* Rolling capture of the last 240 encoded packets: the flag can stay in
++       * place and /tmp/va_pair_<idx>.hevc always holds the most recent
++       * frames. */
++      static int seq;
++      pair_idx = seq % 240;
++      seq++;
++      if (va_env_flag("ANV_VA_PAIR_SRC")) {
++         static bool src_logged;
++         if (!src_logged) {
++            src_logged = true;
++            VLOG("encoder input dump on: /tmp/va_pair_%%03d_src.pgm");
++         }
++         va_pair_dump_src(device, lbuf, job->stage_w, job->stage_h,
++                          job->stage_pitch, pair_idx);
++      }
++   }
++
++   struct anv_address a0, a1;
++   uint64_t mod;
++   uint32_t pitch;
++   if (staged) {
++      a0 = lbuf->address;
++      const uint32_t np = vk_format_get_plane_count(img->vk.format);
++      pitch = job->stage_pitch;
++      a1 = (struct anv_address){ .bo = a0.bo,
++                                 .offset = a0.offset + (VkDeviceSize)pitch * job->stage_h };
++      if (np < 2) a1 = a0;
++      mod = DRM_FORMAT_MOD_LINEAR;
++   } else {
++      const struct anv_surface *p0 = &img->planes[0].primary_surface;
++      a0 = anv_image_address(img, &p0->memory_range);
++      a1 = img->n_planes > 1
++         ? anv_image_address(img, &img->planes[1].primary_surface.memory_range) : a0;
++      mod = isl_modifier(p0->isl.tiling);
++      pitch = p0->isl.row_pitch_B;
++   }
++   if (!a0.bo) { VLOG("no bo"); va_release_linear(device, job); return; }
++   if (mod == DRM_FORMAT_MOD_INVALID) {
++      VLOG("bad tiling"); va_release_linear(device, job); return;
++   }
++
++   int fd = -1;
++   if (drmPrimeHandleToFD(device->fd, a0.bo->gem_handle, DRM_CLOEXEC, &fd) != 0) {
++      VLOG("prime export failed: %s gem=%u", strerror(errno), a0.bo->gem_handle);
++      va_release_linear(device, job); return;
++   }
++
++   va_probe_dma_fence(fd, staged ? "staging" : "app image");
++   const uint32_t nplanes = vk_format_get_plane_count(img->vk.format);
++   const bool multi = nplanes > 1;
++   struct va_drm_frame frame;
++   memset(&frame, 0, sizeof(frame));
++   frame.num_objects = 1;
++   frame.obj[0].fd = fd;
++   frame.obj[0].size = a0.bo->size;
++   frame.obj[0].modifier = mod;
++   int fd1 = -1;
++   if (multi) {
++      int obj = 0;
++      if (a1.bo && a1.bo != a0.bo) {
++         if (drmPrimeHandleToFD(device->fd, a1.bo->gem_handle, DRM_CLOEXEC, &fd1) == 0) {
++            frame.obj[1].fd = fd1;
++            frame.obj[1].size = a1.bo->size;
++            frame.obj[1].modifier = mod;
++            frame.num_objects = 2;
++            obj = 1;
++         }
++      }
++      frame.num_layers = 2;
++      frame.layer[0].drm_format = s->ten_bit ? DRM_FORMAT_R16 : DRM_FORMAT_R8;
++      frame.layer[0].num_planes = 1;
++      frame.layer[0].object_index[0] = 0;
++      frame.layer[0].offset[0] = (uint32_t) a0.offset;
++      frame.layer[0].pitch[0] = pitch;
++      frame.layer[1].drm_format = s->ten_bit ? DRM_FORMAT_RG1616 : DRM_FORMAT_GR88;
++      frame.layer[1].num_planes = 1;
++      frame.layer[1].object_index[0] = obj;
++      frame.layer[1].offset[0] = (uint32_t) a1.offset;
++      frame.layer[1].pitch[0] = img->n_planes > 1
++         ? img->planes[1].primary_surface.isl.row_pitch_B : pitch;
++   } else {
++      frame.num_layers = 1;
++      frame.layer[0].drm_format = DRM_FORMAT_NV12;
++      frame.layer[0].num_planes = 2;
++      frame.layer[0].object_index[0] = 0;
++      frame.layer[0].offset[0] = (uint32_t) a0.offset;
++      frame.layer[0].pitch[0] = pitch;
++      frame.layer[0].object_index[1] = 0;
++      frame.layer[0].offset[1] = (uint32_t) a1.offset;
++      frame.layer[0].pitch[1] = pitch;
++   }
++
++   VLOG("src %s %ux%u pitch=%u off0=%lld off1=%lld mod=0x%llx tiling=%d",
++        staged ? "staged" : "image", job->width, job->height, pitch,
++        (long long)a0.offset, (long long)a1.offset,
++        (unsigned long long)mod, img->planes[0].primary_surface.isl.tiling);
++
++   VASurfaceID src = va_import_surface(s, &frame);
++   if (src == VA_INVALID_SURFACE) {
++      if (fd1 >= 0) close(fd1);
++      close(fd);
++      va_release_linear(device, job);
++      return;
++   }
++
++   /* Slice layout: the application's own boundaries when it named them,
++    * otherwise equal row-aligned slices.  The encoder is row based, so a
++    * split that does not start on a CTU row is clipped to one. */
++   const uint32_t ctu_cols = (s->w + 63) / 64;
++   const uint32_t ctu_rows = (s->h + 63) / 64;
++   const uint32_t n_ctus = ctu_cols * ctu_rows;
++   struct va_frame_params fp;
++   memset(&fp, 0, sizeof(fp));
++   fp.bitrate = bitrate;
++   fp.vbv_ms = vbv_ms;
++   fp.min_qp = want.min_qp;
++   fp.max_qp = want.max_qp;
++   /* The rate controller's per-frame divisor: the stream's real arrival
++    * rate, identical for all three sessions (see g_stream). */
++   {
++      uint32_t rc_fps = s->fps;
++      if (g_stream.fps_meas > 0.0 &&
++          g_stream.fps_meas < (double) s->fps * 0.9)
++         rc_fps = (uint32_t) (g_stream.fps_meas + 0.5);
++      fp.rc_fps = rc_fps < 1 ? 1 : rc_fps;
++   }
++   fp.n_slices = 1;
++   fp.slice_addr[0] = 0;
++   {
++      const bool want_layout = want.slice_layout;
++      uint32_t addr[VA_MAX_SLICES];
++      uint32_t n = 0;
++      bool ok = false;
++      if (want_layout && g_app_slice_addr_count >= 2 &&
++          g_app_slices == g_app_slice_addr_count &&
++          g_app_slice_addr_count <= VA_MAX_SLICES) {
++         bool rows = false;
++         for (uint32_t i = 0; i < g_app_slice_addr_count; i++)
++            if (g_app_slice_addr[i] >= n_ctus)
++               rows = true;
++         for (uint32_t i = 0; i < g_app_slice_addr_count; i++)
++            addr[i] = rows ? (g_app_slice_addr[i] / 64) * ctu_cols
++                           : g_app_slice_addr[i];
++         n = g_app_slice_addr_count;
++         ok = true;
++         for (uint32_t i = 0; i < n && ok; i++) {
++            if (addr[i] % ctu_cols)
++               addr[i] -= addr[i] % ctu_cols;
++            if (i == 0 ? addr[0] != 0 : addr[i] <= addr[i - 1])
++               ok = false;
++            if (addr[i] >= n_ctus)
++               ok = false;
++         }
++      }
++      if (ok) {
++         fp.n_slices = n;
++         for (uint32_t i = 0; i < n; i++)
++            fp.slice_addr[i] = addr[i];
++      } else {
++         const uint32_t want_n = MIN2(want.slices ? want.slices : 1, VA_MAX_SLICES);
++         fp.n_slices = want_n;
++         for (uint32_t i = 0; i < want_n; i++)
++            fp.slice_addr[i] = (uint32_t) ((uint64_t) i * ctu_rows / want_n) * ctu_cols;
++      }
++   }
++
++   /* ANV_VA_DELAY_US: artificial delay to test whether encode latency is
++    * what the headset shows as positional jumps. */
++   {
++      static int delay_us = -1;
++      if (delay_us < 0) {
++         delay_us = 0;
++         const char *d = getenv("ANV_VA_DELAY_US");
++         if (d) delay_us = atoi(d);
++      }
++      if (delay_us > 0) usleep(delay_us);
++   }
++
++   const int64_t t_send = os_time_get_nano();
++   VASurfaceID recon = VA_INVALID_SURFACE;
++   VABufferID coded = va_encode_frame(s, src, &fp, &recon);
++   const int64_t t_enc_done = os_time_get_nano();
++   const int64_t t_sent = os_time_get_nano();
++   if (coded == VA_INVALID_ID) {
++      VLOG("encode failed; no packet for this frame");
++      vaDestroySurfaces(s->dpy, &src, 1);
++      if (fd1 >= 0) close(fd1);
++      close(fd);
++      va_release_linear(device, job);
++      return;
++   }
++
++   void *coded_map = NULL;
++   VAStatus st = vaMapBuffer(s->dpy, coded, &coded_map);
++   if (st != VA_STATUS_SUCCESS || !coded_map) {
++      VLOG("vaMapBuffer(coded) failed: %d (%s)", st, vaErrorStr(st));
++      vaDestroySurfaces(s->dpy, &src, 1);
++      if (fd1 >= 0) close(fd1);
++      close(fd);
++      va_release_linear(device, job);
++      return;
++   }
++   uint8_t *raw = NULL;
++   size_t raw_size = 0;
++   for (VACodedBufferSegment *seg = coded_map; seg; seg = seg->next)
++      raw_size += seg->size;
++   raw = malloc(raw_size ? raw_size : 1);
++   if (raw) {
++      size_t at = 0;
++      for (VACodedBufferSegment *seg = coded_map; seg; seg = seg->next) {
++         memcpy(raw + at, seg->buf, seg->size);
++         at += seg->size;
++      }
++   }
++   vaUnmapBuffer(s->dpy, coded);
++   const int64_t t_copy_done = os_time_get_nano();
++   /* The input surface is only needed until vaSyncSurface() above; the
++    * encode is complete, so the import can go.  iHD keeps no reference after
++    * the sync (the hazard that made the staging ring necessary was a BO that
++    * was freed while a *pooled* surface still pointed at it). */
++   vaDestroySurfaces(s->dpy, &src, 1);
++   if (fd1 >= 0) close(fd1);
++   close(fd);
++   if (!raw) {
++      VLOG("out of memory copying the coded buffer");
++      va_release_linear(device, job);
++      return;
++   }
++
++   uint64_t off = buf->address.offset + dst_off;
++   void *map = buf->address.bo->map;
++   bool mapped = false;
++   if (!map) {
++      if (anv_device_map_bo(device, buf->address.bo, 0, buf->address.bo->size,
++                            NULL, &map) != VK_SUCCESS) {
++         VLOG("dst map failed");
++         free(raw);
++         va_release_linear(device, job);
++         return;
++      }
++      mapped = true;
++   }
++   /* ANV_VA_CAPTURE=1 dumps the raw packets for offline decoding;
++    * ANV_VA_CAPTURE_RANGE="start:count" selects the window. */
++   if (va_env_flag("ANV_VA_CAPTURE")) {
++      static int g_cap;
++      static int cap_start = -1, cap_count = 0;
++      if (cap_start < 0) {
++         cap_start = 100; cap_count = 40;
++         const char *range = getenv("ANV_VA_CAPTURE_RANGE");
++         if (range &&
++             sscanf(range, "%d:%d", &cap_start, &cap_count) != 2 &&
++             sscanf(range, "%d %d", &cap_start, &cap_count) != 2) {
++            cap_start = 100; cap_count = 40;
++         }
++      }
++      if (g_cap >= cap_start && g_cap < cap_start + cap_count) {
++         FILE *df = fopen("/tmp/vrlink_capture.hevc",
++                          g_cap == cap_start ? "wb" : "ab");
++         if (df) { fwrite(raw, 1, raw_size, df); fclose(df); }
++      }
++      g_cap++;
++   }
++   if (pair_idx >= 0) {
++      char ppath[64];
++      snprintf(ppath, sizeof ppath, "/tmp/va_pair_%03d.hevc", pair_idx);
++      FILE *df = fopen(ppath, "wb");
++      if (df) { fwrite(raw, 1, raw_size, df); fclose(df); }
++   }
++   va_log_slice_layout(raw, (int) raw_size);
++   uint8_t *stripped = malloc(raw_size);
++   int slen = stripped ? strip_ps(raw, (int) raw_size, stripped) : (int) raw_size;
++   /* A or B?  raw is what iHD produced, slen what we hand the application.
++    * Some frames arrive with a truncated last slice; this line says whether
++    * the encoder produced the cut (raw == slen + PS) or strip_ps ate it. */
++   VLOGV("pkt raw=%zu stripped=%d dst_range=%llu off=%llu",
++        raw_size, slen, (unsigned long long) job->dst_range,
++        (unsigned long long) job->dst_offset);
++   const uint8_t *bsrc = (stripped && slen > 0) ? stripped : raw;
++   uint32_t n = (uint32_t) slen > job->dst_range ? (uint32_t) job->dst_range : (uint32_t) slen;
++   memcpy((char*)map + off, bsrc, n);
++   util_flush_range((char*)map + off, n);
++   /* Read the destination back for the third slot: if the payload is not
++    * there, the write did not land where the application reads, and that is a
++    * different fault from the application reading the wrong address. */
++   if (job->dst_offset == 8388608 && n > 0) {
++      const uint8_t *dp = (const uint8_t *) map + off;
++      size_t lim = n < 4096 ? n : 4096, dz = 0, sz = 0;
++      for (size_t i = 0; i < lim; i++) { if (!dp[i]) dz++; if (!bsrc[i]) sz++; }
++      static int n_log;
++      if (n_log++ < 30)
++         VLOG("dst readback @8M: first %zu B zeros dst=%zu src=%zu (n=%u)",
++              lim, dz, sz, n);
++   }
++   const uint64_t ph = va_hash64(bsrc, n);
++   const uint64_t phh = va_hash64(bsrc, n < 16384 ? n : 16384);
++   free(stripped);
++   if (mapped)
++      anv_device_unmap_bo(device, buf->address.bo, map, buf->address.bo->size, false);
++   /* The /tmp/va_probe_off second write used to live here.  It copied the
++    * packet to an offset inside another slot "to find where the application
++    * reads", and crashed SteamVR on every attempt: the client owns each
++    * 4 MB slot as a region, so writing anywhere in it that the driver does
++    * not normally write is fatal.  Do not reinstate it. */
++   /* The application computes its read pointer as
++    *    src = base + slot * 4 MiB + <this feedback offset>
++    * and it owns the slot term itself.  Publishing the absolute dst_off
++    * (0/4 MiB/8 MiB) therefore counts the slot twice: slot 1 reads slot 2's
++    * bytes and slot 2 reads 4 MiB past the end of the 12 MiB mapping, into a
++    * zero-filled anon page (the 33.4 % all-zero wire frames).  Publish the
++    * offset within the slot instead; the payload still goes to dst_off. */
++   feedback_set(job->query_pool, job->query_index, job->fb_gen,
++                (uint32_t) (dst_off - (VkDeviceSize) slot * VA_SLOT_BYTES), n);
++   VLOGV("packet %u bytes joboff=%llu img=%p took=%.2fms send=%.2fms "
++        "recv=%.2fms | geom=%ux%u pitch=%u stg=%p stg_size=%llu stg_off=%lld "
++        "| ph=%016llx phh=%016llx slot=%d va_slot=%u dst_size=%llu dst_off=%llu woff=%llu "
++        "| bo=%p bo_size=%llu bo_off=%llu | va bitrate=%llu vbv=%llu vbv_ms=%u slices=%u app=%llu "
++         "| enc=%.2f copy=%.2f tail=%.2f",
++        n, (unsigned long long)job->dst_offset, (void *)img,
++        (os_time_get_nano() - t_start) / 1e6,
++        (t_sent - t_send) / 1e6,
++        0.0,
++        job->width, job->height, pitch,
++        (void *)(lbuf ? lbuf->address.bo : NULL),
++        (unsigned long long)(lbuf ? lbuf->address.bo->size : 0),
++        (long long)a0.offset,
++        (unsigned long long)ph, (unsigned long long)phh, pair_idx, slot,
++        (unsigned long long)buf->vk.size, (unsigned long long)job->dst_offset,
++        (unsigned long long)dst_off,
++        (void *)buf->address.bo,
++        (unsigned long long)buf->address.bo->size,
++         (unsigned long long)buf->address.offset,
++        (unsigned long long)bitrate, (unsigned long long)vbv_bits, vbv_ms,
++         fp.n_slices, (unsigned long long)g_rc_bitrate,
++         (t_enc_done - t_start) / 1e6,
++         (t_copy_done - t_enc_done) / 1e6,
++         (os_time_get_nano() - t_copy_done) / 1e6);
++   {
++      /* The only honest read-back of the rate the encoder actually operates
++       * on: what it delivers. */
++      static uint64_t win_bytes;
++      static uint32_t win_frames;
++      static int64_t win_t0;
++      const int64_t tnow = os_time_get_nano();
++      if (!win_t0)
++         win_t0 = tnow;
++      win_bytes += n;
++      win_frames++;
++      if (tnow - win_t0 > 1000000000ll) {
++         const double secs = (tnow - win_t0) / 1e9;
++         VLOG("rate actual: %.1f Mbit/s over %u frames (%llu B avg) | "
++              "target %llu bit/s, enc.bit_rate=%llu, vbv=%llu",
++              (double) win_bytes * 8.0 / secs / 1e6, win_frames,
++              (unsigned long long)(win_bytes / (win_frames ? win_frames : 1)),
++              (unsigned long long) g_rc_bitrate,
++              (unsigned long long) bitrate,
++              (unsigned long long) vbv_bits);
++         win_bytes = 0; win_frames = 0; win_t0 = tnow;
++      }
++   }
++   {
++      pthread_mutex_lock(&g_stream_lock);
++      /* Delivered rate per slot.  One encoder session per slot means three
++       * independent rate controllers; they must all be run against the same
++       * target and must not drift apart.  This line is deliberately not
++       * "rate actual:" so rate_live.py / rate_report.py ignore it. */
++      static uint64_t slot_bytes[VA_SLOT_COUNT];
++      static uint32_t slot_frames[VA_SLOT_COUNT];
++      static int64_t slot_t0;
++      const int64_t tnow = os_time_get_nano();
++      if (!slot_t0)
++         slot_t0 = tnow;
++      slot_bytes[slot] += n;
++      slot_frames[slot]++;
++      if (tnow - slot_t0 > 1000000000ll) {
++         const double secs = (tnow - slot_t0) / 1e9;
++         for (unsigned i = 0; i < VA_SLOT_COUNT; i++)
++            VLOG("rate slot %u: %.1f Mbit/s over %u frames (%llu B avg) | "
++                 "target %llu bit/s",
++                 i, (double) slot_bytes[i] * 8.0 / secs / 1e6,
++                 slot_frames[i],
++                 (unsigned long long)(slot_bytes[i] /
++                    (slot_frames[i] ? slot_frames[i] : 1)),
++                 (unsigned long long) bitrate);
++         memset(slot_bytes, 0, sizeof slot_bytes);
++         memset(slot_frames, 0, sizeof slot_frames);
++         slot_t0 = tnow;
++      }
++      pthread_mutex_unlock(&g_stream_lock);
++   }
++   free(raw);
++   va_release_linear(device, job);
++}
+diff --git a/src/intel/vulkan/anv_va_encode.h b/src/intel/vulkan/anv_va_encode.h
+new file mode 100644
+index 0000000..4cec7ac
+--- /dev/null
++++ b/src/intel/vulkan/anv_va_encode.h
+@@ -0,0 +1,43 @@
++#ifndef ANV_VA_ENCODE_H
++#define ANV_VA_ENCODE_H
++#include "anv_private.h"
++
++struct anv_va_session;
++struct anv_va_session *anv_va_session_get(struct anv_video_session *vid,
++                                          VkFormat fmt, uint32_t w, uint32_t h,
++                                          uint32_t slot);
++void anv_va_log_msg(const char *msg);
++void anv_va_logf(const char *fmt, ...);
++bool anv_va_verbose(void);
++void anv_va_note_slices(uint32_t count, const uint32_t *addresses, uint32_t n_addr);
++uint32_t anv_va_app_slices(void);
++bool anv_va_staging_enabled(void);
++void anv_va_note_rate_control(uint32_t mode, uint32_t layer_count,
++                              const uint64_t *avg_bitrate,
++                              const uint64_t *max_bitrate,
++                              const uint32_t *fps_num, const uint32_t *fps_den,
++                              uint32_t vbv_ms);
++void anv_va_log_imgwrite(const void *img, int old_layout, int new_layout,
++                         uint64_t dst_stage, uint64_t dst_access);
++void anv_va_log_submit(uint32_t waits, uint32_t signals, uint32_t jobs,
++                       double ms);
++void anv_va_submit_job(struct anv_device *device,
++                       struct anv_video_session *vid,
++                       struct anv_va_job *job,
++                       uint32_t n_signals,
++                       const struct vk_sync_signal *signals,
++                       struct vk_sync *gpu_sync,
++                       struct vk_sync *destroy_sync);
++void anv_va_encode_job(struct anv_device *device, struct anv_video_session *vid,
++                       struct anv_va_job *job);
++bool anv_va_feedback_wait(VkQueryPool pool, uint32_t index, uint64_t timeout_ns);
++bool anv_va_feedback_get(VkQueryPool pool, uint32_t index,
++                         uint32_t *offset, uint32_t *size);
++void anv_va_prepare_linear(struct anv_cmd_buffer *cmd_buffer,
++                          const struct anv_image *src,
++                          struct anv_va_job *job);
++void anv_va_log_query(VkQueryPool pool, uint32_t first, uint32_t count,
++                      size_t stride, const uint32_t *vals);
++size_t anv_va_headers_from_params(struct vk_video_session_parameters *params,
++                                  size_t size_limit, void *data);
++#endif
+diff --git a/src/intel/vulkan/anv_video.c b/src/intel/vulkan/anv_video.c
+index dfc091b..d9be00c 100644
+--- a/src/intel/vulkan/anv_video.c
++++ b/src/intel/vulkan/anv_video.c
+@@ -22,6 +22,17 @@
+  */
+ 
+ #include "anv_private.h"
++#include "anv_va_encode.h"
++
++#include <stdarg.h>
++#include <stdlib.h>
++static void vrprobe(const char *fmt, ...) {
++   const char *path = getenv("ANV_VA_PROBE_LOG");
++   FILE *f = fopen((path && *path) ? path : "/tmp/vrlink-probe.log", "a");
++   if (!f) return;
++   va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
++   fputc('\n', f); fclose(f);
++}
+ 
+ #include "av1_tables.h"
+ #include "vp9_tables.h"
+@@ -34,6 +45,11 @@ anv_CreateVideoSessionKHR(VkDevice _device,
+                            VkVideoSessionKHR *pVideoSession)
+ {
+    ANV_FROM_HANDLE(anv_device, device, _device);
++   vrprobe("CreateVideoSession codec=0x%x extent=%ux%u picFmt=%d refFmt=%d dpb=%u flags=0x%x",
++           pCreateInfo->pVideoProfile->videoCodecOperation,
++           pCreateInfo->maxCodedExtent.width, pCreateInfo->maxCodedExtent.height,
++           pCreateInfo->pictureFormat, pCreateInfo->referencePictureFormat,
++           pCreateInfo->maxDpbSlots, pCreateInfo->flags);
+ 
+    struct anv_video_session *vid =
+       vk_alloc2(&device->vk.alloc, pAllocator, sizeof(*vid), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+@@ -164,6 +180,11 @@ anv_CreateVideoSessionParametersKHR(VkDevice _device, const VkVideoSessionParame
+       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+ 
+    anv_video_patch_session_parameters(device, params);
++   vrprobe("CreateVideoSessionParams codec=0x%x flags=0x%x", params->op, pCreateInfo->flags);
++   if (params->op == VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR)
++      vrprobe("  h265 vps=%u sps=%u pps=%u",
++              params->h265_enc.h265_vps_count, params->h265_enc.h265_sps_count,
++              params->h265_enc.h265_pps_count);
+ 
+    *pVideoSessionParameters = vk_video_session_parameters_to_handle(params);
+    return VK_SUCCESS;
+@@ -286,6 +307,7 @@ anv_GetPhysicalDeviceVideoCapabilitiesKHR(VkPhysicalDevice physicalDevice,
+                                            VkVideoCapabilitiesKHR *pCapabilities)
+ {
+    ANV_FROM_HANDLE(anv_physical_device, pdevice, physicalDevice);
++   vrprobe("GetVideoCaps codec=0x%x", pVideoProfile->videoCodecOperation);
+ 
+    VkResult res = video_profile_supported(pdevice, pVideoProfile);
+    if (res != VK_SUCCESS)
+@@ -297,8 +319,8 @@ anv_GetPhysicalDeviceVideoCapabilitiesKHR(VkPhysicalDevice physicalDevice,
+    pCapabilities->pictureAccessGranularity.height = ANV_MB_HEIGHT;
+    pCapabilities->minCodedExtent.width = ANV_MB_WIDTH;
+    pCapabilities->minCodedExtent.height = ANV_MB_HEIGHT;
+-   pCapabilities->maxCodedExtent.width = 4096;
+-   pCapabilities->maxCodedExtent.height = 4096;
++   pCapabilities->maxCodedExtent.width = 16384;
++   pCapabilities->maxCodedExtent.height = 12288;
+    pCapabilities->flags = VK_VIDEO_CAPABILITY_SEPARATE_REFERENCE_IMAGES_BIT_KHR;
+ 
+    struct VkVideoDecodeCapabilitiesKHR *dec_caps = (struct VkVideoDecodeCapabilitiesKHR *)
+@@ -384,6 +406,9 @@ anv_GetPhysicalDeviceVideoCapabilitiesKHR(VkPhysicalDevice physicalDevice,
+       enc_caps->flags = 0;
+       enc_caps->rateControlModes = VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DEFAULT_KHR |
+                                    VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DISABLED_BIT_KHR;
++      /* vrlink clamps its manual rate slider to this value.  The slider is
++       * labelled Mbps (lowercase b), so 350 Mbps = 350,000,000 bit/s. */
++      enc_caps->maxBitrate = 350ull * 1000ull * 1000ull;
+       enc_caps->maxRateControlLayers = 1;
+       enc_caps->maxQualityLevels = 1;
+       enc_caps->encodeInputPictureGranularity.width = 32;
+@@ -443,7 +468,7 @@ anv_GetPhysicalDeviceVideoCapabilitiesKHR(VkPhysicalDevice physicalDevice,
+ 
+       if (ext) {
+          ext->flags = VK_VIDEO_ENCODE_H265_CAPABILITY_PER_PICTURE_TYPE_MIN_MAX_QP_BIT_KHR;
+-         ext->maxLevelIdc = STD_VIDEO_H265_LEVEL_IDC_5_1;
++         ext->maxLevelIdc = STD_VIDEO_H265_LEVEL_IDC_6_2;
+          ext->ctbSizes = VK_VIDEO_ENCODE_H265_CTB_SIZE_32_BIT_KHR |
+                          VK_VIDEO_ENCODE_H265_CTB_SIZE_64_BIT_KHR;
+          ext->transformBlockSizes = VK_VIDEO_ENCODE_H265_TRANSFORM_BLOCK_SIZE_4_BIT_KHR |
+@@ -484,6 +509,9 @@ anv_GetPhysicalDeviceVideoCapabilitiesKHR(VkPhysicalDevice physicalDevice,
+       break;
+    }
+ 
++   vrprobe("  caps maxCoded=%ux%u dpb=%u",
++           pCapabilities->maxCodedExtent.width, pCapabilities->maxCodedExtent.height,
++           pCapabilities->maxDpbSlots);
+    return VK_SUCCESS;
+ }
+ 
+@@ -1110,6 +1138,18 @@ anv_GetEncodedVideoSessionParametersKHR(VkDevice device,
+    if (pData)
+       size_limit = *pDataSize;
+ 
++   if (params->op == VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR) {
++      size_t va_size = anv_va_headers_from_params(params, size_limit, pData);
++      if (va_size) {
++         if (pData && *pDataSize < va_size) {
++            *pDataSize = 0;
++            return VK_INCOMPLETE;
++         }
++         *pDataSize = va_size;
++         return VK_SUCCESS;
++      }
++   }
++
+    switch (params->op) {
+    case VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR: {
+       const struct VkVideoEncodeH264SessionParametersGetInfoKHR *h264_get_info =
+diff --git a/src/intel/vulkan/genX_cmd_buffer.c b/src/intel/vulkan/genX_cmd_buffer.c
+index 19a057b..336f688 100644
+--- a/src/intel/vulkan/genX_cmd_buffer.c
++++ b/src/intel/vulkan/genX_cmd_buffer.c
+@@ -25,6 +25,7 @@
+ #include <stdbool.h>
+ 
+ #include "anv_private.h"
++#include "anv_va_encode.h"
+ #include "anv_measure.h"
+ #include "vk_common_entrypoints.h"
+ #include "vk_render_pass.h"
+@@ -5601,6 +5602,24 @@ cmd_buffer_barrier(struct anv_cmd_buffer *cmd_buffer,
+                    const VkDependencyInfo *dep_infos,
+                    const char *reason)
+ {
++   /* Diagnostic: record every write the application makes to a VA-API encode
++    * source image, with a timestamp, so we can tell whether the atlas views are
++    * updated across several submissions (see bmg-shim/CHECKPOINT.md). */
++   for (uint32_t di = 0; di < n_dep_infos; di++) {
++      for (uint32_t bi = 0; bi < dep_infos[di].imageMemoryBarrierCount; bi++) {
++         ANV_FROM_HANDLE(anv_image, _img,
++                         dep_infos[di].pImageMemoryBarriers[bi].image);
++         const VkImageMemoryBarrier2 *b =
++            &dep_infos[di].pImageMemoryBarriers[bi];
++         if (_img &&
++             (_img->vk.usage & VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR) &&
++             (b->dstAccessMask & (VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
++                                  VK_ACCESS_2_SHADER_WRITE_BIT)))
++            anv_va_log_imgwrite(_img, b->oldLayout, b->newLayout,
++                                b->dstStageMask, b->dstAccessMask);
++      }
++   }
++
+    switch (cmd_buffer->batch.engine_class) {
+    case INTEL_ENGINE_CLASS_VIDEO:
+       cmd_buffer_barrier_video(cmd_buffer, n_dep_infos, dep_infos,
+diff --git a/src/intel/vulkan/genX_cmd_video.c b/src/intel/vulkan/genX_cmd_video.c
+index b776108..c7173dd 100644
+--- a/src/intel/vulkan/genX_cmd_video.c
++++ b/src/intel/vulkan/genX_cmd_video.c
+@@ -22,6 +22,7 @@
+  */
+ 
+ #include "anv_private.h"
++#include "anv_va_encode.h"
+ 
+ #include "genxml/gen_macros.h"
+ #include "genxml/genX_video_pack.h"
+@@ -70,6 +71,20 @@ genX(CmdControlVideoCodingKHR)(VkCommandBuffer commandBuffer,
+              (rate_control_info->rateControlMode == VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DISABLED_BIT_KHR));
+ 
+       cmd_buffer->video.vid->rc_mode = rate_control_info->rateControlMode;
++
++      /* Hand the application's rate control to the VA-API encoder backend. */
++      uint64_t avg[8] = { 0 }, max[8] = { 0 };
++      uint32_t num[8] = { 0 }, den[8] = { 0 };
++      const uint32_t nlayers = MIN2(rate_control_info->layerCount, 8);
++      for (uint32_t l = 0; l < nlayers; l++) {
++         avg[l] = rate_control_info->pLayers[l].averageBitrate;
++         max[l] = rate_control_info->pLayers[l].maxBitrate;
++         num[l] = rate_control_info->pLayers[l].frameRateNumerator;
++         den[l] = rate_control_info->pLayers[l].frameRateDenominator;
++      }
++      anv_va_note_rate_control(rate_control_info->rateControlMode, nlayers,
++                               avg, max, num, den,
++                               rate_control_info->virtualBufferSizeInMs);
+    }
+ }
+ 
+diff --git a/src/intel/vulkan/genX_cmd_video_enc.c b/src/intel/vulkan/genX_cmd_video_enc.c
+index a65a5ef..04c16f1 100644
+--- a/src/intel/vulkan/genX_cmd_video_enc.c
++++ b/src/intel/vulkan/genX_cmd_video_enc.c
+@@ -22,6 +22,15 @@
+  */
+ 
+ #include "anv_private.h"
++#include "anv_va_encode.h"
++
++#include <stdarg.h>
++static void vrprobe(const char *fmt, ...) {
++   FILE *f = fopen("/home/buchner/vrlink-probe.log", "a");
++   if (!f) return;
++   va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
++   fputc('\n', f); fclose(f);
++}
+ 
+ #include "genxml/gen_macros.h"
+ #include "genxml/genX_video_pack.h"
+@@ -2873,16 +2882,89 @@ genX(CmdEncodeVideoKHR)(VkCommandBuffer commandBuffer,
+                         const VkVideoEncodeInfoKHR *pEncodeInfo)
+ {
+    ANV_FROM_HANDLE(anv_cmd_buffer, cmd_buffer, commandBuffer);
++   vrprobe("CmdEncode src=%ux%u bitstreamOff=%llu maxRange=%llu refs=%u setup=%d",
++           pEncodeInfo->srcPictureResource.codedExtent.width,
++           pEncodeInfo->srcPictureResource.codedExtent.height,
++           (unsigned long long)pEncodeInfo->dstBufferOffset,
++           (unsigned long long)pEncodeInfo->dstBufferRange,
++           pEncodeInfo->referenceSlotCount,
++           pEncodeInfo->pSetupReferenceSlot ? 1 : 0);
+ 
+    const VkVideoInlineQueryInfoKHR *inline_query =
+       vk_find_struct_const(pEncodeInfo->pNext, VIDEO_INLINE_QUERY_INFO_KHR);
+ 
++   if (cmd_buffer->video.vid->vk.op == VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR &&
++       cmd_buffer->n_va_jobs < 8) {
++      struct anv_va_job *j = &cmd_buffer->va_jobs[cmd_buffer->n_va_jobs++];
++      /* The slot may hold a previous recording's staging buffer handle. */
++      memset(j, 0, sizeof(*j));
++      j->session = anv_video_session_to_handle(cmd_buffer->video.vid);
++      j->src_view = pEncodeInfo->srcPictureResource.imageViewBinding;
++      j->dst_buffer = pEncodeInfo->dstBuffer;
++      j->dst_offset = pEncodeInfo->dstBufferOffset;
++      j->dst_range = pEncodeInfo->dstBufferRange;
++      j->width = pEncodeInfo->srcPictureResource.codedExtent.width;
++      j->height = pEncodeInfo->srcPictureResource.codedExtent.height;
++      j->query_pool = inline_query ? inline_query->queryPool : cmd_buffer->va_query_pool;
++      j->query_index = inline_query ? inline_query->firstQuery : cmd_buffer->va_query_index;
++      {
++         /* The slice layout the application asks for. */
++         const VkVideoEncodeH265PictureInfoKHR *h265_pi =
++            vk_find_struct_const(pEncodeInfo->pNext,
++                                 VIDEO_ENCODE_H265_PICTURE_INFO_KHR);
++         uint32_t addrs[16];
++         uint32_t n_addr = 0;
++         if (h265_pi) {
++            j->app_slices = h265_pi->naluSliceSegmentEntryCount;
++            for (uint32_t s = 0; s < h265_pi->naluSliceSegmentEntryCount &&
++                                 n_addr < ARRAY_SIZE(addrs); s++) {
++               const VkVideoEncodeH265NaluSliceSegmentInfoKHR *e =
++                  &h265_pi->pNaluSliceSegmentEntries[s];
++               addrs[n_addr++] = e->pStdSliceSegmentHeader ?
++                                 e->pStdSliceSegmentHeader->slice_segment_address : 0;
++            }
++         }
++         anv_va_note_slices(j->app_slices, addrs, n_addr);
++         /* Which optional structures does the application attach?  A per-frame
++          * size hint would explain a truncated last slice, so record the chain
++          * once instead of guessing. */
++         {
++            static bool logged;
++            if (!logged) {
++               logged = true;
++               char chain[256];
++               size_t off = 0;
++               for (const VkBaseInStructure *b =
++                       (const VkBaseInStructure *) pEncodeInfo->pNext;
++                    b && off + 12 < sizeof chain; b = b->pNext)
++                  off += snprintf(chain + off, sizeof chain - off, " %d",
++                                  (int) b->sType);
++               anv_va_logf("encode pNext chain sTypes:%s", chain);
++               if (h265_pi) {
++                  off = 0;
++                  chain[0] = 0;
++                  for (const VkBaseInStructure *b =
++                          (const VkBaseInStructure *) h265_pi->pNext;
++                       b && off + 12 < sizeof chain; b = b->pNext)
++                     off += snprintf(chain + off, sizeof chain - off, " %d",
++                                     (int) b->sType);
++                  anv_va_logf("H265 picture info pNext sTypes:%s", chain);
++               }
++            }
++         }
++      }
++      {
++         ANV_FROM_HANDLE(anv_image_view, _iv, pEncodeInfo->srcPictureResource.imageViewBinding);
++         anv_va_prepare_linear(cmd_buffer, _iv->image, j);
++      }
++   }
++
+    switch (cmd_buffer->video.vid->vk.op) {
+    case VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR:
+       anv_h264_encode_video(cmd_buffer, pEncodeInfo);
+       break;
+    case VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR:
+-      anv_h265_encode_video(cmd_buffer, pEncodeInfo);
++      /* Handled by the VA-API backend at submit time (job captured above). */
+       break;
+    default:
+       assert(0);
+diff --git a/src/intel/vulkan/genX_init_state.c b/src/intel/vulkan/genX_init_state.c
+index 025f27d..add6bcd 100644
+--- a/src/intel/vulkan/genX_init_state.c
++++ b/src/intel/vulkan/genX_init_state.c
+@@ -1052,6 +1052,16 @@ genX(init_device_state)(struct anv_device *device)
+       }
+       case INTEL_ENGINE_CLASS_VIDEO:
+          res = init_copy_video_queue_state(queue);
++         if (res != VK_SUCCESS)
++            return res;
++
++         /**
++          * Video queues have an RCS companion too (blorp cannot run on the
++          * video engines).  It needs the same initial render state as the
++          * compute/copy companions, otherwise the 3D pipeline is left with an
++          * empty drawing rectangle and every blit is clipped away.
++          */
++         res = init_render_queue_state(queue, true /* is_companion_rcs_batch */);
+          break;
+       case INTEL_ENGINE_CLASS_COPY:
+          res = init_copy_video_queue_state(queue);
+diff --git a/src/intel/vulkan/genX_query.c b/src/intel/vulkan/genX_query.c
+index 881d80a..88ff16e 100644
+--- a/src/intel/vulkan/genX_query.c
++++ b/src/intel/vulkan/genX_query.c
+@@ -28,6 +28,7 @@
+ #include <fcntl.h>
+ 
+ #include "anv_private.h"
++#include "anv_va_encode.h"
+ 
+ #include "util/os_time.h"
+ 
+@@ -551,6 +552,23 @@ VkResult genX(GetQueryPoolResults)(
+    ANV_FROM_HANDLE(anv_device, device, _device);
+    ANV_FROM_HANDLE(anv_query_pool, pool, queryPool);
+ 
++   if (pool->vk.query_type == VK_QUERY_TYPE_VIDEO_ENCODE_FEEDBACK_KHR) {
++      uint32_t dbg[3] = { 0, 0, 0 };
++      for (uint32_t i = 0; i < queryCount; i++) {
++         uint32_t off = 0, sz = 0;
++         /* The packet is produced by the encode worker; wait for it so the
++          * application does not observe a not-yet-ready entry. */
++         if (!anv_va_feedback_wait(queryPool, firstQuery + i, 200ull * 1000 * 1000))
++            anv_va_log_msg("feedback wait timed out");
++         anv_va_feedback_get(queryPool, firstQuery + i, &off, &sz);
++         uint32_t *o = (uint32_t *)((char *)pData + i * stride);
++         o[0] = off; o[1] = sz; o[2] = 1;
++         if (i == 0) { dbg[0] = off; dbg[1] = sz; dbg[2] = 1; }
++      }
++      anv_va_log_query(queryPool, firstQuery, queryCount, stride, dbg);
++      return VK_SUCCESS;
++   }
++
+    assert(
+ #if GFX_VERx10 >= 125
+    pool->vk.query_type == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR ||
+@@ -1137,6 +1155,10 @@ void genX(CmdBeginQueryIndexedEXT)(
+ {
+    ANV_FROM_HANDLE(anv_cmd_buffer, cmd_buffer, commandBuffer);
+    ANV_FROM_HANDLE(anv_query_pool, pool, queryPool);
++   if (pool->vk.query_type == VK_QUERY_TYPE_VIDEO_ENCODE_FEEDBACK_KHR) {
++      cmd_buffer->va_query_pool = queryPool;
++      cmd_buffer->va_query_index = query;
++   }
+    struct anv_address query_addr = anv_query_address(pool, query);
+ 
+    if (append_query_clear_flush(cmd_buffer, pool,
+@@ -1349,6 +1371,8 @@ void genX(CmdEndQueryIndexedEXT)(
+ {
+    ANV_FROM_HANDLE(anv_cmd_buffer, cmd_buffer, commandBuffer);
+    ANV_FROM_HANDLE(anv_query_pool, pool, queryPool);
++   if (pool->vk.query_type == VK_QUERY_TYPE_VIDEO_ENCODE_FEEDBACK_KHR)
++      cmd_buffer->va_query_pool = VK_NULL_HANDLE;
+    struct anv_address query_addr = anv_query_address(pool, query);
+ 
+    struct mi_builder b;
+diff --git a/src/intel/vulkan/meson.build b/src/intel/vulkan/meson.build
+index be26923..ff8d146 100644
+--- a/src/intel/vulkan/meson.build
++++ b/src/intel/vulkan/meson.build
+@@ -166,6 +166,7 @@ foreach _gfx_ver : ['90', '110', '120', '125', '200', '300', '350']
+ endforeach
+ 
+ libanv_files = files(
++  'anv_va_encode.c',
+   'i915/anv_batch_chain.c',
+   'i915/anv_batch_chain.h',
+   'i915/anv_device.c',
+@@ -302,6 +303,10 @@ libanv_common = static_library(
+   dependencies : anv_deps
+ )
+ 
++# The encode shim drives libva directly; libavcodec is no longer involved.
++dep_libva = dependency('libva')
++dep_libva_drm = dependency('libva-drm')
++
+ libvulkan_intel = shared_library(
+   'vulkan_intel',
+   [files('anv_gem.c'), anv_entrypoints[0], bvh_spv],
+@@ -314,6 +319,7 @@ libvulkan_intel = shared_library(
+   ],
+   dependencies : [
+     dep_thread, dep_dl, dep_m, anv_deps, idep_libintel_common,
++    dep_libva, dep_libva_drm,
+     idep_nir, idep_genxml, idep_vulkan_util, idep_vulkan_wsi,
+     idep_vulkan_runtime, idep_mesautil, idep_xmlconfig,
+     idep_intel_driver_ds, idep_intel_dev, idep_intel_blorp,
+diff --git a/src/intel/vulkan/xe/anv_batch_chain.c b/src/intel/vulkan/xe/anv_batch_chain.c
+index 6543691..fb924ba 100644
+--- a/src/intel/vulkan/xe/anv_batch_chain.c
++++ b/src/intel/vulkan/xe/anv_batch_chain.c
+@@ -24,6 +24,7 @@
+ #include "xe/anv_batch_chain.h"
+ 
+ #include "anv_private.h"
++#include "anv_va_encode.h"
+ #include "anv_measure.h"
+ #include "common/intel_bind_timeline.h"
+ #include "common/xe/intel_gem.h"
+@@ -265,6 +266,10 @@ xe_companion_rcs_queue_exec_locked(struct anv_queue *queue,
+    exec.address = batch_bo->bo->offset;
+ 
+    anv_measure_submit(companion_rcs_cmd_buffer);
++   anv_va_logf("companion exec q=%u addr=0x%llx nbo=%u syncs=%u",
++               queue->companion_rcs_id, (unsigned long long) exec.address,
++               (unsigned) list_length(&companion_rcs_cmd_buffer->batch_bos),
++               xe_syncs_count);
+    xe_exec_print_debug(queue, 1, &companion_rcs_cmd_buffer, NULL, 0, &exec);
+ 
+    result = xe_exec_ioctl(queue, &exec);
+diff --git a/src/intel/vulkan/xe/anv_queue.c b/src/intel/vulkan/xe/anv_queue.c
+index 8707935..6a4f36c 100644
+--- a/src/intel/vulkan/xe/anv_queue.c
++++ b/src/intel/vulkan/xe/anv_queue.c
+@@ -198,7 +198,8 @@ anv_xe_create_engine(struct anv_device *device,
+       return result;
+ 
+    if (queue->family->engine_class == INTEL_ENGINE_CLASS_COPY ||
+-       queue->family->engine_class == INTEL_ENGINE_CLASS_COMPUTE) {
++       queue->family->engine_class == INTEL_ENGINE_CLASS_COMPUTE ||
++       queue->family->engine_class == INTEL_ENGINE_CLASS_VIDEO) {
+       result = create_engine(device, queue, pCreateInfo,
+                              true /* create_companion_rcs_engine */);
+    }
