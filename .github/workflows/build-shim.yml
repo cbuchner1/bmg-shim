@@ -5,6 +5,7 @@ on:
   push:
     paths:
       - 'patches/**'
+      - 'docker/**'
       - '.github/workflows/build-shim.yml'
 
 jobs:

@@ -84,8 +84,9 @@ sudo ./install-cachyos.sh --no-deps          # skip pacman build-dependency inst
 ```
 
 The installer is self-contained; a CachyOS container is only an optional
-local verification aid and is not required for installation.  See
-`INSTALL-cachyos.md` for the full native and container instructions.
+verification aid and is not required for installation.  See
+`INSTALL-cachyos.md` and `docker/Dockerfile` for the full native and
+container instructions.
 
 ### Verify the install
 
