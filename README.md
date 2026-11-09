@@ -180,8 +180,15 @@ rtw89 debugfs:
 It finds the adapter by USB ID `28de:2432`, so the interface name can be
 `wlan0`, `wlan1`, etc.
 
-Install as a oneshot service re-applied every 5 s (the EDCA registers can be
-cleared on reassociation/stream restart):
+The recommended install is the dispatcher, which creates the apply script,
+the oneshot service and the 5 s timer on the first Steam Frame `wlan1` up:
+
+```sh
+sudo install -m 0755 scripts/90-optimize-latency-for-steam-frame \
+  /etc/NetworkManager/dispatcher.d/90-optimize-latency-for-steam-frame
+```
+
+The manual equivalent (if you do not use NetworkManager) is:
 
 ```sh
 sudo install -m 0755 scripts/rtw89-low-latency-apply.sh \
@@ -217,7 +224,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now rtw89-low-latency.timer
 ```
 
-The `90-steam-frame-no-bgscan` dispatcher can also install and run it on
+The `90-optimize-latency-for-steam-frame` dispatcher can also install and run it on
 `wlan1` up (see that script). It requires `CONFIG_RTW89_DEBUGFS=y` and does
 not work under Secure Boot lockdown.
 

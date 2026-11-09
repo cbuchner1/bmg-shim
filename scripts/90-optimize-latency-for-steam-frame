@@ -1,0 +1,127 @@
+#!/bin/sh
+# Disable wpa_supplicant background scanning on the dedicated Steam Frame
+# adapter.
+#
+# NetworkManager writes bgscan="simple:30:-70:86400" for infrastructure
+# connections.  The "simple" algorithm scans every 30 s whenever the signal is
+# below -70 dBm, and a scan costs several seconds of latency and heavy packet
+# loss - which is unacceptable on the link that carries the video stream.  On
+# a dedicated point-to-point adapter there is nothing to roam to, so the scan
+# can simply be switched off.
+#
+# Installed as /etc/NetworkManager/dispatcher.d/90-steam-frame-no-bgscan
+
+[ -n "$1" ] || exit 0
+[ "$2" = "up" ] || exit 0
+[ "$CONNECTION_ID" = "Steam Frame Wireless Adapter" ] || exit 0
+
+log() { logger -t steamframe-bgscan "$*"; }
+
+# The dispatcher can fire the "up" action a moment before wpa_supplicant
+# reports an associated network id; retry briefly instead of exiting early
+# and letting the default bgscan come back.
+i=0
+NET_ID=""
+while [ "$i" -lt 5 ]; do
+    NET_ID=$(wpa_cli -i "$1" status 2>/dev/null |
+             awk -F= '$1 == "id" { print $2; exit }')
+    [ -n "$NET_ID" ] && break
+    i=$((i + 1))
+    sleep 1
+done
+
+if [ -z "$NET_ID" ]; then
+    log "$1: no wpa_supplicant network id after $i retries; bgscan unchanged"
+    exit 0
+fi
+
+before=$(wpa_cli -i "$1" get_network "$NET_ID" bgscan 2>/dev/null)
+if wpa_cli -i "$1" set_network "$NET_ID" bgscan '""' >/dev/null 2>&1; then
+    log "$1: bgscan was $before, now disabled (network id $NET_ID)"
+else
+    log "$1: FAILED to disable bgscan (network id $NET_ID, was $before)"
+fi
+
+if iw dev "$1" set power_save off 2>/dev/null; then
+    log "$1: power save disabled"
+else
+    log "$1: FAILED to disable power save"
+fi
+
+# Install the rtw89 low-latency apply script + oneshot service + 5 s timer.
+# Kept here so a fresh host gets the whole setup from this dispatcher.
+install_low_latency() {
+    cat > /usr/local/bin/rtw89-low-latency-apply.sh <<'APPLY'
+#!/bin/bash
+set -u
+edca="003F3219"
+# Find the Steam Frame Wireless Adapter (28de:2432) by USB IDs, regardless
+# of the interface name (wlan0/wlan1/... can change between ports/boots).
+dev=""
+for d in /sys/class/net/*; do
+  [[ "$(cat "$d/device/../idVendor" 2>/dev/null)" == 28de && \
+     "$(cat "$d/device/../idProduct" 2>/dev/null)" == 2432 ]] && dev="$d" && break
+done
+# Optional fallback for callers that pass an interface name.
+[ -n "$dev" ] || { [ -n "${1:-}" ] && dev="/sys/class/net/$1"; }
+[ -n "$dev" ] && [ -d "$dev" ] || exit 0
+iface=$(basename "$dev")
+[[ "$(iw dev "$iface" link 2>/dev/null)" == Connected* ]] || exit 0
+d="/sys/kernel/debug/ieee80211/$(basename "$(readlink -f "$dev/phy80211")")/rtw89"
+[ -d "$d" ] || exit 0
+echo "c300 4" > "$d/read_reg" 2>/dev/null
+[[ "$(grep -o '0x[0-9a-f]*$' "$d/read_reg" 2>/dev/null)" == "0x${edca,,}" ]] && exit 0
+echo 0x30 > "$d/disable_dm" 2>/dev/null
+iw dev "$iface" set power_save off 2>/dev/null
+iw dev "$iface" set tidconf tids 0xff amsdu off 2>/dev/null
+for r in c300 c304 c308 c30c; do echo "$r $edca 4" > "$d/write_reg" 2>/dev/null; done
+
+# Disable wpa_supplicant background scanning for this dedicated link.
+NET_ID=$(wpa_cli -i "$iface" status 2>/dev/null | awk -F= '$1 == "id" { print $2; exit }')
+if [ -n "$NET_ID" ]; then
+  before=$(wpa_cli -i "$iface" get_network "$NET_ID" bgscan 2>/dev/null)
+  if wpa_cli -i "$iface" set_network "$NET_ID" bgscan '""' >/dev/null 2>&1; then
+    echo "disabled bgscan on $iface (network id $NET_ID, was $before)"
+  fi
+fi
+echo "applied low latency mode on $iface"
+APPLY
+    chmod 0755 /usr/local/bin/rtw89-low-latency-apply.sh
+
+    cat > /etc/systemd/system/rtw89-low-latency.service <<'UNIT'
+[Unit]
+Description=rtw89 low-latency mode for Steam Frame adapter (oneshot)
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/rtw89-low-latency-apply.sh
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+    cat > /etc/systemd/system/rtw89-low-latency.timer <<'TIMER'
+[Unit]
+Description=Reapply rtw89 low-latency mode every 5 s
+
+[Timer]
+OnBootSec=5s
+OnUnitActiveSec=5s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
+TIMER
+
+    systemctl daemon-reload
+    systemctl enable --now rtw89-low-latency.timer >/dev/null 2>&1 || true
+}
+
+install_low_latency
+
+# Initial rtw89 low-latency apply; the timer re-applies because the EDCA
+# registers can be cleared on reassociation/stream restart.
+if /usr/local/bin/rtw89-low-latency-apply.sh >/dev/null 2>&1; then
+    log "$1: low-latency mode applied"
+fi
