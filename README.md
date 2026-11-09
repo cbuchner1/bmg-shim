@@ -45,6 +45,82 @@ overlay bar.
 
 Try running a game with modest graphics requirement first, such as Beat Saber.
 
+## WiFi tuning for the Steam Frame adapter
+
+These two fixes target the wireless link, not the Vulkan shim. They are
+optional but are reported to remove most of the "stream reset storm" packet
+loss (see ValveSoftware/SteamVR-for-Linux#965 and ValveSoftware/SteamOS#2952).
+
+### Host: 6 GHz TX power override (`rtw89`)
+
+The Frame advertises its 6 GHz AP as VLP, so the in-tree `rtw89` driver caps
+the adapter at 7 dBm (single chain) / 4 dBm (two chain). The Windows driver
+uses the chip maximum (16 / 13 dBm). The `reg6_pwr_override` patch adds a
+module parameter to force the LPI power class.
+
+1. Patch `drivers/net/wireless/realtek/rtw89/regd.c` for your kernel: add a
+   `reg6_pwr_override` `module_param` before
+   `rtw89_reg_6ghz_power_recalc()`, and in that function, after
+   `rcu_read_unlock()`, set `rtwvif_link->reg_6ghz_power` from the override
+   when `active`.
+2. Build against the running kernel and install:
+
+   ```sh
+   cd <kernel-src>/drivers/net/wireless/realtek/rtw89
+   make -C /lib/modules/$(uname -r)/build M=$PWD modules LLVM=1
+   sudo mkdir -p /lib/modules/$(uname -r)/updates/rtw89
+   sudo cp rtw89_*.ko /lib/modules/$(uname -r)/updates/rtw89/
+   sudo depmod -a
+   ```
+
+3. Set the option:
+
+   ```sh
+   echo 'options rtw89_core reg6_pwr_override=2' | \
+     sudo tee /etc/modprobe.d/rtw89-frame.conf
+   ```
+
+4. Reboot (or replug the adapter; a plain module reload can leave it
+   rfkill-ed) and verify:
+
+   ```sh
+   sudo dmesg | grep "6 GHz power class forced"
+   sudo cat /sys/kernel/debug/ieee80211/phy*/rtw89/txpwr_table | \
+     grep -E "reg6_pwr_type|OFDM_2TX|MCS_2TX_160M"
+   ```
+
+   Expected: `6 GHz power class forced to 1 by reg6_pwr_override` and
+   `[reg6_pwr_type] 1`.
+
+LPI is the indoor 6 GHz class (allowed indoors in the EU/US/Canada as far as
+the issue reports go; check your regulatory domain). The override is not
+persistent across kernel updates — rebuild after each update.
+
+### Headset: `ath12k` reorder timeout
+
+The headset ships `rx_reorder_timeout=2,2,2,2`, tuned for a dongle that caps
+retries. A Linux host does not cap them the same way, so late retries fall
+outside the 2 ms reorder window and vrlink sees holes.
+
+On the headset (SSH as `steamos`, password as configured):
+
+```sh
+echo 'options ath12k rx_reorder_timeout=0,0,0,0' | \
+  sudo tee /etc/modprobe.d/ath12k.conf
+sudo reboot
+```
+
+After the reboot, verify:
+
+```sh
+cat /sys/module/ath12k/parameters/rx_reorder_timeout
+# expect: 0,0,0,0
+```
+
+`0` means the driver default (100/100/100/40 ms). The value is only read when
+the radio starts, so a reboot (not just a module reload) is required. Headset
+OS updates delete `/etc/modprobe.d/ath12k.conf`, so re-apply after updates.
+
 ## How to build and install
 
 ### Pre-installation requirements
