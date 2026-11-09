@@ -96,6 +96,64 @@ LPI is the indoor 6 GHz class (allowed indoors in the EU/US/Canada as far as
 the issue reports go; check your regulatory domain). The override is not
 persistent across kernel updates — rebuild after each update.
 
+### Host: rtw89 low-latency mode (EDCA/aggregation)
+
+SteamOS normally runs `holo-realtek-firmware-toggles set-low-latency-mode on`
+when the adapter connects; desktop Steam does not ship it, so the adapter
+keeps the default EDCA/aggregation settings. The script in
+`scripts/rtw89-low-latency-apply.sh` reproduces the important parts through
+rtw89 debugfs:
+
+- aggressive EDCA on all four queues (`c300`/`c304`/`c308`/`c30c` =
+  `003F3219`: TXOP 2000 µs, CWmax 7, CWmin 3, AIFSN 1),
+- `disable_dm` `0x30` (firmware `HW_SCAN`/`INACTIVE_PS` off),
+- power save off,
+- A-MSDU off.
+
+It finds the adapter by USB ID `28de:2432`, so the interface name can be
+`wlan0`, `wlan1`, etc.
+
+Install as a oneshot service re-applied every 5 s (the EDCA registers can be
+cleared on reassociation/stream restart):
+
+```sh
+sudo install -m 0755 scripts/rtw89-low-latency-apply.sh \
+  /usr/local/bin/rtw89-low-latency-apply.sh
+
+sudo tee /etc/systemd/system/rtw89-low-latency.service >/dev/null <<'EOF'
+[Unit]
+Description=rtw89 low-latency mode for Steam Frame adapter
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/rtw89-low-latency-apply.sh
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo tee /etc/systemd/system/rtw89-low-latency.timer >/dev/null <<'EOF'
+[Unit]
+Description=Reapply rtw89 low-latency mode every 5 s
+
+[Timer]
+OnBootSec=5s
+OnUnitActiveSec=5s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now rtw89-low-latency.timer
+```
+
+The `90-steam-frame-no-bgscan` dispatcher can also install and run it on
+`wlan1` up (see that script). It requires `CONFIG_RTW89_DEBUGFS=y` and does
+not work under Secure Boot lockdown.
+
 ### Headset: `ath12k` reorder timeout
 
 The headset ships `rx_reorder_timeout=2,2,2,2`, tuned for a dongle that caps
