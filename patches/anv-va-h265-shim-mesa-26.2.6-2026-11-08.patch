@@ -391,10 +391,10 @@ index d19f824..8b96968 100644
                                0, 0, &queue->companion_sync);
 diff --git a/src/intel/vulkan/anv_va_encode.c b/src/intel/vulkan/anv_va_encode.c
 new file mode 100644
-index 0000000..17b71b7
+index 0000000..4b2995b
 --- /dev/null
 +++ b/src/intel/vulkan/anv_va_encode.c
-@@ -0,0 +1,3528 @@
+@@ -0,0 +1,3540 @@
 +#include "anv_va_encode.h"
 +#include <stdio.h>
 +#include <fcntl.h>
@@ -455,6 +455,19 @@ index 0000000..17b71b7
 +{
 +   const char *v = getenv(name);
 +   return v && *v && strcmp(v, "0") != 0;
++}
++
++/* The source image is handed to iHD as a dma-buf carrying the render fence.
++ * Default to relying on iHD's implicit fence (no CPU wait); ANV_VA_CPU_WAIT=1
++ * restores the explicit vk_sync_wait.  ANV_VA_NO_CPU_WAIT=1 remains accepted
++ * as the old spelling of the default. */
++static bool va_cpu_wait(void)
++{
++   if (va_env_flag("ANV_VA_CPU_WAIT"))
++      return true;
++   if (va_env_flag("ANV_VA_NO_CPU_WAIT"))
++      return false;
++   return false;
 +}
 +static uint32_t va_env_u32(const char *name, uint32_t def)
 +{
@@ -958,10 +971,9 @@ index 0000000..17b71b7
 +      if (w.gpu_sync) {
 +         /* The staging copy was recorded in the submission this sync stands
 +          * for, so the buffer is complete once it signals. */
-+         /* The frame's dma-buf carries the render fence, so if iHD honours
-+          * implicit fencing the hardware can do this wait and the worker need
-+          * not block.  ANV_VA_NO_CPU_WAIT=1 skips it to test exactly that. */
-+         if (!va_env_flag("ANV_VA_NO_CPU_WAIT"))
++         /* The frame's dma-buf carries the render fence, so iHD can do this
++          * wait implicitly; ANV_VA_CPU_WAIT=1 forces the explicit wait. */
++         if (va_cpu_wait())
 +            vk_sync_wait(&w.device->vk, w.gpu_sync, 1, 0, UINT64_MAX);
 +         vk_sync_destroy(&w.device->vk, w.gpu_sync);
 +      }
@@ -1016,7 +1028,7 @@ index 0000000..17b71b7
 +
 +   if (va_env_flag("ANV_VA_SYNC")) {
 +      if (gpu_sync) {
-+         if (!va_env_flag("ANV_VA_NO_CPU_WAIT"))
++         if (va_cpu_wait())
 +            vk_sync_wait(&device->vk, gpu_sync, 1, 0, UINT64_MAX);
 +         vk_sync_destroy(&device->vk, gpu_sync);
 +      }
