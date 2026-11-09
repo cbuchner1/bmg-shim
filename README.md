@@ -224,9 +224,8 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now rtw89-low-latency.timer
 ```
 
-The `90-optimize-latency-for-steam-frame` dispatcher can also install and run it on
-`wlan1` up (see that script). It requires `CONFIG_RTW89_DEBUGFS=y` and does
-not work under Secure Boot lockdown.
+Both routes require `CONFIG_RTW89_DEBUGFS=y` and do not work under Secure
+Boot lockdown.
 
 ### Headset: `ath12k` reorder timeout
 
