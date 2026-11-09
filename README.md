@@ -27,9 +27,12 @@ the Steam Frame or controllers for the following reasons:
 Initially start with low specs, such that steaming quality issues are not
 caused by overloading the render/encoding pipeline from the start.
 
+- General: Lower Refresh Rate (Hz) to 72.
 - General: Set render resolution to Custom 2476x2476 per eye (100%)
 - Steam Link: Set Target Bandwidth to Auto
 - Steam Link: Set Encoded Video Size to Manual, Size (px) to 768
+
+You can gradually raise the settings if thinks work well for you.
 
 ## Enabling VR streaming
 
