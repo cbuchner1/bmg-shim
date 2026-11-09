@@ -108,7 +108,9 @@ rtw89 debugfs:
   `003F3219`: TXOP 2000 µs, CWmax 7, CWmin 3, AIFSN 1),
 - `disable_dm` `0x30` (firmware `HW_SCAN`/`INACTIVE_PS` off),
 - power save off,
-- A-MSDU off.
+- A-MSDU off,
+- wpa_supplicant background scanning off for the Steam Frame network
+  (`wpa_cli set_network <id> bgscan ""`).
 
 It finds the adapter by USB ID `28de:2432`, so the interface name can be
 `wlan0`, `wlan1`, etc.
