@@ -45,9 +45,74 @@ overlay bar.
 
 Try running a game with modest graphics requirement first, such as Beat Saber.
 
+## How to build and install
+
+### Pre-installation requirements
+
+Install the Intel graphics/Vulkan runtime and the verification tools before
+running the installer:
+
+```sh
+sudo pacman -S --needed \
+  mesa vulkan-intel vulkan-icd-loader intel-media-driver \
+  libva libdrm linux-firmware \
+  vulkan-tools libva-utils intel-gpu-tools
+```
+
+- `mesa` / `vulkan-intel` / `vulkan-icd-loader` — Intel ANV driver, the
+  `libvulkan_intel.so` ICD and the Vulkan loader.
+- `intel-media-driver` / `libva` — iHD VA-API backend used by the shim.
+- `libdrm` / `linux-firmware` — DRM and GPU firmware.
+- `vulkan-tools` (`vulkaninfo`), `libva-utils` (`vainfo`) and
+  `intel-gpu-tools` (`intel_gpu_top`) — verification/diagnostics.
+
+### Running the installation script
+On CachyOS, the installer builds the patched ANV driver from the matching
+patch in `patches/` and installs it over the distro's `libvulkan_intel.so`:
+
+```sh
+sudo ./install-cachyos.sh
+```
+
+It detects the installed `vulkan-intel`/`mesa` version, selects
+`patches/anv-va-h265-shim-mesa-<version>-2026-11-08.patch`, installs the
+build dependencies, clones the matching Mesa tag, applies the patch, builds
+`libvulkan_intel.so`, backs up the existing one and installs the new one.
+
+Options:
+
+```sh
+sudo ./install-cachyos.sh --version 26.2.5   # if detection is ambiguous
+sudo ./install-cachyos.sh --so /path/libvulkan_intel.so   # deploy a prebuilt
+sudo ./install-cachyos.sh --restore          # roll back
+sudo ./install-cachyos.sh --build           # build from patches (default)
+sudo ./install-cachyos.sh --no-deps          # skip pacman build-dependency install
+```
+
+The installer is self-contained; a CachyOS container is only an optional
+verification aid and is not required for installation.  See
+`INSTALL-cachyos.md` and `docker/Dockerfile` for the full native and
+container instructions.
+
+### Verify the install
+
+Confirm that the H.265 video encode path is exposed:
+
+```sh
+vulkaninfo 2>/dev/null | grep -iE "VK_KHR_video_encode"
+```
+
+Expected output:
+
+```
+VK_KHR_video_encode_h264                      : extension revision 14
+VK_KHR_video_encode_h265                      : extension revision 14
+VK_KHR_video_encode_queue                     : extension revision 12
+```
+
 ## WiFi tuning for the Steam Frame adapter
 
-These two fixes target the wireless link, not the Vulkan shim. They are
+The following fixes target the wireless link, not the Vulkan shim. They are
 optional but are reported to remove most of the "stream reset storm" packet
 loss (see ValveSoftware/SteamVR-for-Linux#965 and ValveSoftware/SteamOS#2952).
 
@@ -180,68 +245,3 @@ cat /sys/module/ath12k/parameters/rx_reorder_timeout
 `0` means the driver default (100/100/100/40 ms). The value is only read when
 the radio starts, so a reboot (not just a module reload) is required. Headset
 OS updates delete `/etc/modprobe.d/ath12k.conf`, so re-apply after updates.
-
-## How to build and install
-
-### Pre-installation requirements
-
-Install the Intel graphics/Vulkan runtime and the verification tools before
-running the installer:
-
-```sh
-sudo pacman -S --needed \
-  mesa vulkan-intel vulkan-icd-loader intel-media-driver \
-  libva libdrm linux-firmware \
-  vulkan-tools libva-utils intel-gpu-tools
-```
-
-- `mesa` / `vulkan-intel` / `vulkan-icd-loader` — Intel ANV driver, the
-  `libvulkan_intel.so` ICD and the Vulkan loader.
-- `intel-media-driver` / `libva` — iHD VA-API backend used by the shim.
-- `libdrm` / `linux-firmware` — DRM and GPU firmware.
-- `vulkan-tools` (`vulkaninfo`), `libva-utils` (`vainfo`) and
-  `intel-gpu-tools` (`intel_gpu_top`) — verification/diagnostics.
-
-### Running the installation script
-On CachyOS, the installer builds the patched ANV driver from the matching
-patch in `patches/` and installs it over the distro's `libvulkan_intel.so`:
-
-```sh
-sudo ./install-cachyos.sh
-```
-
-It detects the installed `vulkan-intel`/`mesa` version, selects
-`patches/anv-va-h265-shim-mesa-<version>-2026-11-08.patch`, installs the
-build dependencies, clones the matching Mesa tag, applies the patch, builds
-`libvulkan_intel.so`, backs up the existing one and installs the new one.
-
-Options:
-
-```sh
-sudo ./install-cachyos.sh --version 26.2.5   # if detection is ambiguous
-sudo ./install-cachyos.sh --so /path/libvulkan_intel.so   # deploy a prebuilt
-sudo ./install-cachyos.sh --restore          # roll back
-sudo ./install-cachyos.sh --build           # build from patches (default)
-sudo ./install-cachyos.sh --no-deps          # skip pacman build-dependency install
-```
-
-The installer is self-contained; a CachyOS container is only an optional
-verification aid and is not required for installation.  See
-`INSTALL-cachyos.md` and `docker/Dockerfile` for the full native and
-container instructions.
-
-### Verify the install
-
-Confirm that the H.265 video encode path is exposed:
-
-```sh
-vulkaninfo 2>/dev/null | grep -iE "VK_KHR_video_encode"
-```
-
-Expected output:
-
-```
-VK_KHR_video_encode_h264                      : extension revision 14
-VK_KHR_video_encode_h265                      : extension revision 14
-VK_KHR_video_encode_queue                     : extension revision 12
-```
