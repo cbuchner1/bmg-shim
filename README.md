@@ -161,6 +161,41 @@ LPI is the indoor 6 GHz class (allowed indoors in the EU/US/Canada as far as
 the issue reports go; check your regulatory domain). The override is not
 persistent across kernel updates — rebuild after each update.
 
+### Host: rtw89 6 GHz RX-stats kernel fix
+
+`patches/rtw89-6ghz-rx-stats-fix.patch` contains two driver changes:
+
+- the `reg6_pwr_override` parameter for the 6 GHz power class (see above),
+- a NULL check in `rtw89_vif_rx_stats_iter()`:
+
+  ```c
+  - if (!bss_conf->bssid)
+  + if (!bss_conf || !bss_conf->bssid)
+  ```
+
+  Without it, an RX report during association/scan can dereference a NULL
+  `bss_conf` and oops in `rtw89_vif_rx_stats_iter()` (a separate issue from
+  CVE-2025-38646; that CVE's `support_bands` check is already present in
+  7.3.3).
+
+Apply it to the kernel source for your running kernel, then build and install
+the modules:
+
+```sh
+cd <kernel-src>
+patch -p1 < /path/to/patches/rtw89-6ghz-rx-stats-fix.patch
+cd drivers/net/wireless/realtek/rtw89
+make -C /lib/modules/$(uname -r)/build M=$PWD modules LLVM=1
+sudo mkdir -p /lib/modules/$(uname -r)/updates/rtw89
+sudo cp rtw89_core.ko rtw89_usb.ko rtw89_8852c.ko rtw89_8852cu.ko \
+  /lib/modules/$(uname -r)/updates/rtw89/
+sudo depmod -a
+```
+
+Rebuild after every kernel update. The module is loaded from
+`/lib/modules/$(uname -r)/updates/rtw89/`; verify with
+`modinfo -F filename rtw89_core` and `dmesg | grep "6 GHz power class"`.
+
 ### Host: rtw89 low-latency mode (EDCA/aggregation)
 
 SteamOS normally runs `holo-realtek-firmware-toggles set-low-latency-mode on`
