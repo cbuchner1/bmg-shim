@@ -32,7 +32,7 @@ caused by overloading the render/encoding pipeline from the start.
 - Steam Link: Set Target Bandwidth to Auto
 - Steam Link: Set Encoded Video Size to Manual, Size (px) to 768
 
-You can gradually raise the settings if thinks work well for you.
+You can gradually raise the settings when things work well for you.
 
 ## Enabling VR streaming
 
