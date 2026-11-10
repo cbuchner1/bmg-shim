@@ -22,6 +22,10 @@ iw dev "$iface" set power_save off 2>/dev/null
 iw dev "$iface" set tidconf tids 0xff amsdu off 2>/dev/null
 for r in c300 c304 c308 c30c; do echo "$r $edca 4" > "$d/write_reg" 2>/dev/null; done
 
+# Windows-style aggregation/retry caps: 512 us A-MPDU airtime, 6 retries.
+echo "0xC610 0x107f3f3f 4" > "$d/write_reg" 2>/dev/null
+echo "0xC62C 0x06060000 4" > "$d/write_reg" 2>/dev/null
+
 # Disable wpa_supplicant background scanning for this dedicated link.
 NET_ID=$(wpa_cli -i "$iface" status 2>/dev/null | awk -F= '$1 == "id" { print $2; exit }')
 if [ -n "$NET_ID" ]; then

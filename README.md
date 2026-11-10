@@ -175,7 +175,9 @@ rtw89 debugfs:
 - power save off,
 - A-MSDU off,
 - wpa_supplicant background scanning off for the Steam Frame network
-  (`wpa_cli set_network <id> bgscan ""`).
+  (`wpa_cli set_network <id> bgscan ""`),
+- Windows-style MAC aggregation/retry caps: `0xC610 = 0x107f3f3f` (512 µs
+  A-MPDU airtime) and `0xC62C = 0x06060000` (6 retries).
 
 It finds the adapter by USB ID `28de:2432`, so the interface name can be
 `wlan0`, `wlan1`, etc.
