@@ -70,7 +70,12 @@ iface=$(basename "$dev")
 d="/sys/kernel/debug/ieee80211/$(basename "$(readlink -f "$dev/phy80211")")/rtw89"
 [ -d "$d" ] || exit 0
 echo "c300 4" > "$d/read_reg" 2>/dev/null
-[[ "$(grep -o '0x[0-9a-f]*$' "$d/read_reg" 2>/dev/null)" == "0x${edca,,}" ]] && exit 0
+if [[ "$(grep -o '0x[0-9a-f]*$' "$d/read_reg" 2>/dev/null)" == "0x${edca,,}" ]]; then
+  # EDCA already applied; still refresh the aggregation/retry caps.
+  echo "0xC610 0x107f3f3f 4" > "$d/write_reg" 2>/dev/null
+  echo "0xC62C 0x06060000 4" > "$d/write_reg" 2>/dev/null
+  exit 0
+fi
 echo 0x30 > "$d/disable_dm" 2>/dev/null
 iw dev "$iface" set power_save off 2>/dev/null
 iw dev "$iface" set tidconf tids 0xff amsdu off 2>/dev/null
