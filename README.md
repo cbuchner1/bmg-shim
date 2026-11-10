@@ -288,3 +288,35 @@ cat /sys/module/ath12k/parameters/rx_reorder_timeout
 `0` means the driver default (100/100/100/40 ms). The value is only read when
 the radio starts, so a reboot (not just a module reload) is required. Headset
 OS updates delete `/etc/modprobe.d/ath12k.conf`, so re-apply after updates.
+
+### Headset: Wi-Fi power saving
+
+The headset can also power-save its `wlan0`/`wlanap` radios, which adds
+wake-up latency to the link. On the headset:
+
+```sh
+for i in wlan0 wlanap; do
+  sudo iw dev "$i" set power_save off
+done
+```
+
+To make it persistent, set the NetworkManager default (the headset uses NM
+for `wlan0`; `wlanap` is managed by `softapmanager`/`hostapd`):
+
+```sh
+sudo tee /etc/NetworkManager/conf.d/99-wifi-powersave-off.conf >/dev/null <<'EOF'
+[connection]
+wifi.powersave = 2
+EOF
+sudo systemctl restart NetworkManager
+```
+
+Verify:
+
+```sh
+for i in wlan0 wlanap; do iw dev "$i" get power_save; done
+# expect: Power save: off
+```
+
+A headset OS update/downgrade can restore the default power-save policy, so
+re-check after switching builds.
