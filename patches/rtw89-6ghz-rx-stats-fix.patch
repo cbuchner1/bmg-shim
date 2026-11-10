@@ -1,0 +1,45 @@
+diff --git a/drivers/net/wireless/realtek/rtw89/core.c b/drivers/net/wireless/realtek/rtw89/core.c
+index 397ebbfca..1b2dd663a 100644
+--- a/drivers/net/wireless/realtek/rtw89/core.c
++++ b/drivers/net/wireless/realtek/rtw89/core.c
+@@ -3096,7 +3096,7 @@ static void rtw89_vif_rx_stats_iter(void *data, u8 *mac,
+ 		goto out;
+ 
+ 	bss_conf = rtw89_vif_rcu_dereference_link(rtwvif_link, false);
+-	if (!bss_conf->bssid)
++	if (!bss_conf || !bss_conf->bssid)
+ 		goto out;
+ 
+ 	if (ieee80211_is_trigger(hdr->frame_control)) {
+diff --git a/drivers/net/wireless/realtek/rtw89/regd.c b/drivers/net/wireless/realtek/rtw89/regd.c
+index 14fab6b1a..fa3429458 100644
+--- a/drivers/net/wireless/realtek/rtw89/regd.c
++++ b/drivers/net/wireless/realtek/rtw89/regd.c
+@@ -1129,6 +1129,13 @@ static bool __rtw89_reg_6ghz_power_recalc(struct rtw89_dev *rtwdev)
+ 	return true;
+ }
+ 
++/* Explicit 6 GHz power class for the Steam Frame adapter (28de:2432).
++ * 0 = follow the AP (default), 1 = VLP, 2 = LPI, 3 = SP.
++ */
++static int reg6_pwr_override;
++module_param(reg6_pwr_override, int, 0644);
++MODULE_PARM_DESC(reg6_pwr_override, "6 GHz power class override: 0 follow AP, 1 VLP, 2 LPI, 3 SP");
++
+ static int rtw89_reg_6ghz_power_recalc(struct rtw89_dev *rtwdev,
+ 				       struct rtw89_vif_link *rtwvif_link, bool active,
+ 				       unsigned int *changed)
+@@ -1171,6 +1178,13 @@ static int rtw89_reg_6ghz_power_recalc(struct rtw89_dev *rtwdev,
+ 
+ 	rcu_read_unlock();
+ 
++	if (active && reg6_pwr_override >= 1 && reg6_pwr_override <= 3) {
++		rtwvif_link->reg_6ghz_power = reg6_pwr_override - 1;
++		dflt = false;
++		rtw89_info(rtwdev, "6 GHz power class forced to %d by reg6_pwr_override\n",
++			   rtwvif_link->reg_6ghz_power);
++	}
++
+ 	if (!dflt && blocked[rtwvif_link->reg_6ghz_power]) {
+ 		rtw89_debug(rtwdev, RTW89_DBG_REGD,
+ 			    "%c%c 6 GHz power type-%u is blocked by policy\n",
