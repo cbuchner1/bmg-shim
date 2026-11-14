@@ -59,3 +59,37 @@ wait); set `ANV_VA_CPU_WAIT=1` to restore the explicit `vk_sync_wait`.
 The distro package is `vulkan-intel 3:26.2.6-1`; installing the 26.2.6 build
 would make the ICD file version match the package again (still patched, so
 `pacman -Qkk vulkan-intel` would still flag the file).
+
+## rtw89 Steam Frame dongle fixes (kernel)
+
+These are the same two changes for each kernel base:
+
+- `reg6_pwr_override` in `drivers/net/wireless/realtek/rtw89/regd.c`
+  (`options rtw89_core reg6_pwr_override=2` forces the LPI 6 GHz power class),
+- a NULL `bss_conf` check in `rtw89_vif_rx_stats_iter()` in `core.c` (fixes
+  the `+0x192` oops; separate from CVE-2025-38646, whose `support_bands`
+  check is already present).
+
+Kernel-specific snapshots:
+
+| Kernel | Patch |
+|---|---|
+| `7.3.1` / `7.3.3` | `rtw89-6ghz-rx-stats-fix.patch` |
+| `7.3.4` | `rtw89-6ghz-rx-stats-fix-7.3.4.patch` |
+| `7.4-rc1` | `rtw89-6ghz-rx-stats-fix-7.4-rc1.patch` |
+
+Apply the one matching the running kernel, then build against its headers:
+
+```sh
+cd <kernel-src>
+patch -p1 < ~/bmg-shim/patches/rtw89-6ghz-rx-stats-fix-<ver>.patch
+cd drivers/net/wireless/realtek/rtw89
+make -C /lib/modules/$(uname -r)/build M=$PWD modules LLVM=1
+sudo mkdir -p /lib/modules/$(uname -r)/updates/rtw89
+sudo cp rtw89_core.ko rtw89_usb.ko rtw89_8852c.ko rtw89_8852cu.ko \
+  /lib/modules/$(uname -r)/updates/rtw89/
+sudo depmod -a
+```
+
+The line numbers differ between kernels, which is why each has its own
+snapshot; the hunks are otherwise identical.
